@@ -33,7 +33,7 @@ Double-click **`Timelapse Engine.bat`**, or run `python -m timelapse_engine.gui`
   it in Explorer. Queues save and load as JSON (`timelapse_engine.jobs`), and you can also run those files from a
   script with `run_job`.
 - **Other details:** the log tab shows engine messages, and the status bar shows free GPU memory. Window layout
-  and your last settings are remembered in `%APPDATA%	imelapse-engine\gui.ini`.
+  and your last settings are remembered in `%APPDATA%\timelapse-engine\gui.ini`.
 
 ## Quick start
 
