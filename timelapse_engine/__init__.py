@@ -19,8 +19,9 @@ from .files import SequenceMismatchError, load_image, load_raw, save_image
 from .outputs import FFmpegVideoSink, ImageSequenceSink, VideoOutput, h264_preview, hevc_lossless_master, prores_master
 from .processors import PROCESSORS, Processor, create_processor, list_processors
 from .progress import CancelToken, Cancelled, ConsoleProgress, enable_console_logging
-from .sources import FrameSource, ImageSequence, VideoSource
+from .jobs import Job, load_queue, run_job, save_queue
+from .sources import FrameSource, ImageSequence, SubsetSource, VideoSource
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [name for name in dir() if not name.startswith("_")]

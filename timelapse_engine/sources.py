@@ -159,6 +159,57 @@ class ImageSequence(FrameSource):
             self._pool = None
 
 
+class SubsetSource(FrameSource):
+    """A selection of frames from another source (a frame range, or a spread of
+    frames), optionally downscaled so the longest side is ``max_side`` - used
+    for frame ranges and for fast low-resolution previews."""
+
+    def __init__(self, source: FrameSource, indices: Sequence[int], max_side: Optional[int] = None):
+        self.source = source
+        self.indices = list(indices)
+        if not self.indices:
+            raise ValueError("SubsetSource needs at least one frame.")
+        self.max_side = max_side
+        self.name = source.name
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def _resize(self, frame: np.ndarray) -> np.ndarray:
+        frame = files.as_hwc(frame)
+        h, w = frame.shape[:2]
+        if not self.max_side or max(h, w) <= self.max_side:
+            return frame
+        import cv2
+
+        s = self.max_side / max(h, w)
+        small = cv2.resize(frame, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
+        return files.as_hwc(small)
+
+    def read_raw(self, indices: Sequence[int]) -> List[np.ndarray]:
+        return [self._resize(f) for f in self.source.read_raw([self.indices[i] for i in indices])]
+
+    def read_into(self, indices: Sequence[int], out: np.ndarray) -> None:
+        if self.max_side is None or self.probe()[0] == self.source.probe()[0]:
+            self.source.read_into([self.indices[i] for i in indices], out)  # no resize: fast path
+        else:
+            super().read_into(indices, out)
+
+    def capture_time(self, index: int) -> Optional[datetime]:
+        return self.source.capture_time(self.indices[index])
+
+    def latest_capture_time(self) -> Optional[datetime]:
+        times = [t for t in (self.source.capture_time(i) for i in self.indices) if t is not None]
+        return max(times) if times else None
+
+    def xmp(self, index: int) -> Optional[bytes]:
+        return self.source.xmp(self.indices[index])
+
+    @property
+    def fps(self) -> Optional[float]:
+        return self.source.fps
+
+
 class VideoSource(FrameSource):
     """A video file (MP4, MOV, ...) read through imageio's FFmpeg plugin.
 

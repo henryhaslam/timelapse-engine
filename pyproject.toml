@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "timelapse-engine"
-version = "0.2.0"
+version = "0.3.0"
 description = "Stacking and rolling-window blending for large timelapse sequences and video"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,10 +23,14 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x"]
+gui = ["PySide6>=6.7"]
 test = ["pytest"]
 
+[project.gui-scripts]
+timelapse-gui = "timelapse_engine.gui:main"
+
 [tool.setuptools]
-packages = ["timelapse_engine"]
+packages = ["timelapse_engine", "timelapse_engine.gui"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

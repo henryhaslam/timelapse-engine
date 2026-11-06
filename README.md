@@ -10,12 +10,30 @@ This is a cleaned-up rewrite of `image_functions_2.py`; the original is kept unc
 
 ```bash
 pip install -e .            # from this folder
-pip install -e .[gpu]       # + CuPy (CUDA 12)
+pip install -e .[gpu,gui]   # + CuPy (CUDA 12) and the desktop app (PySide6)
 ```
 
 FFmpeg must be on `PATH` for video output. exiftool is optional (used for fast EXIF sorting); it is found via the
 `TIMELAPSE_EXIFTOOL` environment variable, `PATH`, or an `exiftool-*` folder next to this repo. Without it, EXIF
 is read with Pillow.
+
+## Desktop app
+
+Double-click **`Timelapse Engine.bat`**, or run `python -m timelapse_engine.gui` (`timelapse-gui` once installed).
+
+- **Source:** pick an image folder or a video. Frames are sorted by capture time and checked once, and you can
+  limit the job to a frame range. The scrubber steps through frames, showing each file name and capture time.
+- **Effect:** choose what to create (single image, video or image sequence), the effect and its settings. The
+  settings form is built from each effect's parameters, with tooltips.
+- **Preview** (Ctrl+P) renders the current settings in about a second at reduced resolution, using frames spread
+  across the sequence for a still, or the rolling window at the scrubber for video. With *Update automatically*
+  on, it re-renders as you change settings or scrub. Wheel to zoom, drag to pan, double-click to fit.
+- **Queue:** add as many jobs as you like and start them. Each shows its speed and time left, and Cancel stops
+  the running job. Double-click a job to load its settings back into the form; double-click its output to open
+  it in Explorer. Queues save and load as JSON (`timelapse_engine.jobs`), and you can also run those files from a
+  script with `run_job`.
+- **Other details:** the log tab shows engine messages, and the status bar shows free GPU memory. Window layout
+  and your last settings are remembered in `%APPDATA%	imelapse-engine\gui.ini`.
 
 ## Quick start
 
@@ -52,6 +70,8 @@ See [`examples/run_pipeline.py`](examples/run_pipeline.py) for the full batch wo
 | `files.py` | Loading, sorting, validation, XMP/EXIF, saving |
 | `progress.py` | Progress callback, `CancelToken`, console progress bar |
 | `stabilise.py` | Point picking, LK tracking, translation stabilisation |
+| `jobs.py` | `Job` (one saveable render description), queue files, previews, parameter metadata |
+| `gui/` | PySide6 desktop app |
 
 The engine never prints or calls `input()`. Progress goes to a `progress(done, total, message)` callback, and a
 `CancelToken` stops a job between batches, which is what a GUI needs.
@@ -164,5 +184,5 @@ Clean-up:
 ## Tests
 
 ```bash
-pytest            # or: python tests/test_engine.py
+pytest            # or: python tests/test_engine.py && python tests/test_gui.py
 ```
