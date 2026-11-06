@@ -21,7 +21,7 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from . import backend, files
+from . import backend, files, metadata
 from .backend import HAS_CUPY, asnumpy, cp
 from .outputs import (FFmpegVideoSink, ImageSequenceSink, Sink, h264_preview, hevc_lossless_master,
                       hevc_nvenc_master, prores_master)
@@ -239,7 +239,8 @@ def stack_to_file(source, process: ProcessorSpec, export_dir, export_name: Optio
     timestamp = src.latest_capture_time()
     if timestamp is not None and timestamp_offset is not None:
         timestamp += timestamp_offset
-    saved = files.save_image(out_path, result, xmp=src.xmp(len(src) - 1), timestamp=timestamp)
+    meta = metadata.summarise(src, range(len(src)), processor.name, params, kind="stack")
+    saved = files.save_image(out_path, result, timestamp=timestamp, metadata=meta)
     logger.info("Saved %s", saved)
     return saved
 
@@ -377,8 +378,10 @@ def render_windows(source, process: ProcessorSpec, sinks: Sequence[Sink], blend:
             else:
                 result = _run_window(processor, [cache[i] for i in range(start, end)], scale, plan.chunk, gpu)
             frame16 = backend.to_uint16(result)  # stays on the GPU; sinks convert/download what they need
+            meta = (metadata.summarise(src, range(start, end), processor.name, params, kind="window")
+                    if any(getattr(s, "wants_metadata", False) for s in sinks) else None)
             for sink in sinks:
-                sink.write(frame16)
+                sink.write(frame16, meta)
             written += 1
             report(progress, written, total, processor.name)
     finally:
@@ -439,7 +442,11 @@ def render_video(source, process: ProcessorSpec, export_dir, export_name: Option
     if not outputs:
         raise ValueError("No video outputs selected.")
 
-    sink = FFmpegVideoSink(outputs, fps=fps, ffmpeg_path=ffmpeg_path, overwrite=overwrite)
+    name = process.name if isinstance(process, Processor) else process
+    n_out = len(window_starts(len(src), blend, step, include_partial))
+    meta = metadata.summarise(src, range(len(src)), name, params, kind="video", blend=blend, step=step,
+                              fps=fps, outputs=n_out)
+    sink = FFmpegVideoSink(outputs, fps=fps, ffmpeg_path=ffmpeg_path, overwrite=overwrite, metadata=meta)
     render_windows(src, process, [sink], blend, step, include_partial, progress, cancel, device, batch_size,
                    **params)
     return sink.outputs

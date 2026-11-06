@@ -27,7 +27,9 @@ from .progress import logger
 
 
 class Sink:
-    def write(self, frame: np.ndarray) -> None:
+    wants_metadata = False  # set True to receive per-frame OutputMetadata in write()
+
+    def write(self, frame: np.ndarray, meta=None) -> None:
         raise NotImplementedError
 
     def close(self) -> None:
@@ -45,7 +47,10 @@ class Sink:
 
 
 class ImageSequenceSink(Sink):
-    """Writes ``<name>_0001.tiff``, ``<name>_0002.tiff``, ... using several encoder threads."""
+    """Writes ``<name>_0001.tiff``, ``<name>_0002.tiff``, ... using several encoder threads.
+    Each frame gets its own metadata (which frames were blended, their capture times...)."""
+
+    wants_metadata = True
 
     def __init__(self, export_dir, export_name: str, ext: str = "tiff", overwrite: str = "increment",
                  workers: int = 4):
@@ -59,12 +64,12 @@ class ImageSequenceSink(Sink):
         self._pending: Deque[Future] = deque()
         self._max_pending = workers * 2
 
-    def write(self, frame):
+    def write(self, frame, meta=None):
         self.index += 1
         path = files.resolve_output_path(
             self.export_dir / f"{self.export_name}_{self.index:04d}.{self.ext}", self.overwrite)
         self._written.append(path)
-        self._pending.append(self._pool.submit(files.save_image, path, asnumpy(frame)))
+        self._pending.append(self._pool.submit(files.save_image, path, asnumpy(frame), metadata=meta))
         while len(self._pending) >= self._max_pending:  # bound memory; surface errors early
             self._pending.popleft().result()
 
@@ -127,8 +132,9 @@ _BT709 = ["-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt7
 class _Encoder:
     """One FFmpeg process fed by its own writer thread."""
 
-    def __init__(self, ffmpeg: str, output: VideoOutput, fps: float, queue_size: int):
+    def __init__(self, ffmpeg: str, output: VideoOutput, fps: float, queue_size: int, metadata_args=()):
         self.ffmpeg, self.output, self.fps = ffmpeg, output, fps
+        self.metadata_args = list(metadata_args)
         self.queue: "queue.Queue" = queue.Queue(maxsize=queue_size)
         self.proc: Optional[subprocess.Popen] = None
         self.thread: Optional[threading.Thread] = None
@@ -139,7 +145,8 @@ class _Encoder:
         return [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                 "-f", "rawvideo", "-pix_fmt", o.pix_fmt, "-s", f"{width}x{height}", "-r", str(self.fps),
                 *_BT709, "-i", "-",
-                *o.codec_args, "-pix_fmt", o.pix_fmt, *_BT709, "-r", str(self.fps), str(o.path)]
+                *o.codec_args, "-pix_fmt", o.pix_fmt, *_BT709, *self.metadata_args,
+                "-r", str(self.fps), str(o.path)]
 
     def start(self, width: int, height: int):
         self.output.path.parent.mkdir(parents=True, exist_ok=True)
@@ -197,7 +204,7 @@ class FFmpegVideoSink(Sink):
     """
 
     def __init__(self, outputs: Sequence[VideoOutput], fps: float = 24, ffmpeg_path: str = "ffmpeg",
-                 overwrite: str = "increment", queue_size: int = 3):
+                 overwrite: str = "increment", queue_size: int = 3, metadata=None):
         if not outputs:
             raise ValueError("FFmpegVideoSink needs at least one VideoOutput.")
         exe = shutil.which(ffmpeg_path) or (ffmpeg_path if Path(ffmpeg_path).is_file() else None)
@@ -207,9 +214,11 @@ class FFmpegVideoSink(Sink):
             VideoOutput(files.resolve_output_path(o.path, overwrite), o.codec_args, o.pix_fmt, o.size)
             for o in outputs
         ]
-        self._encoders = [_Encoder(exe, o, fps, queue_size) for o in self.video_outputs]
+        from .metadata import ffmpeg_args
 
-    def write(self, frame):
+        self._encoders = [_Encoder(exe, o, fps, queue_size, ffmpeg_args(metadata)) for o in self.video_outputs]
+
+    def write(self, frame, meta=None):
         for enc in self._encoders:
             data, (h, w) = colour.pack(frame, enc.output.pix_fmt, enc.output.size)
             if enc.proc is None:

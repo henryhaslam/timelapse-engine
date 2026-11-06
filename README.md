@@ -85,6 +85,28 @@ descriptions.
 The same processor code is used for still stacks and video windows, so a blended video frame matches the still you
 would get from the same frames.
 
+## Output metadata
+
+Every output records what it is and where it came from, so Lightroom (or any EXIF viewer) shows it:
+
+| Field | Example |
+|---|---|
+| Title | `Maximum stack - 270 frames` |
+| Caption / description | `Maximum stack of 270 frames \| source frames 21-290 of 312 from 2026.06.07_copenhill \| 1 s exposures every 2 s \| 2026-06-07 13:14:42 to 13:23:40 (8 min 58 s) \| total exposure 4 min 30 s \| Panasonic DC-GX9, LUMIX G 20/F1.7 II, 20 mm f/4.5 ISO 400 \| settings: motion_threshold=30` |
+| Camera and lens | make, model, lens, focal length, aperture, ISO and exposure time from the source frames |
+| Colour profile | the source's ICC profile (e.g. ProPhoto RGB), so colours display as in the originals |
+| Capture time | stills: last frame + 1 minute (sorts after the sequence); sequence frames: last frame of each window |
+| EXIF UserComment | the same facts as JSON (`frames`, `interval_s`, `exposure_s`, `start`/`end`, `params`, …) |
+
+Details:
+
+- **With exiftool** (found automatically), all EXIF, IPTC and XMP is copied from the last source frame, including
+  Lightroom's develop settings. Those are marked `AlreadyApplied`, so Lightroom won't apply them twice. Document IDs
+  are not copied, so each output counts as a new image.
+- **Without exiftool**, Pillow and tifffile still write the caption, camera, profile and dates.
+- **Image sequences:** each frame describes its own window.
+- **Videos:** these get a title, a description and a creation time.
+
 ## Performance
 
 How a frame moves through the engine (GPU path):

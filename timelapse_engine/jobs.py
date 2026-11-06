@@ -21,7 +21,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from . import backend, engine
+from . import backend, engine, files
 from .processors import PROCESSORS, create_processor
 from .progress import CancelToken, ProgressCallback
 from .sources import FrameSource, ImageSequence, SubsetSource, VideoSource
@@ -167,11 +167,7 @@ def default_export(source: str) -> Tuple[str, str]:
     if not source:
         return "", ""
     p = Path(source)
-    if p.is_file() or p.suffix.lower() in VIDEO_EXTENSIONS:
-        return str(p.parent), p.stem
-    if p.name.lower().startswith("export") and p.parent != p:
-        return str(p.parent), p.parent.name
-    return str(p.parent), p.name
+    return str(p.parent), files.shoot_name(p)
 
 
 def is_video(path: str) -> bool:

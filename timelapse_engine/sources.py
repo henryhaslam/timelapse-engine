@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -62,6 +62,14 @@ class FrameSource(ABC):
     def xmp(self, index: int) -> Optional[bytes]:
         return None
 
+    def frame_info(self, index: int) -> Optional[files.FrameInfo]:
+        """Capture details (time, exposure, camera, lens) of a frame, if known."""
+        return None
+
+    def frame_path(self, index: int) -> Optional[str]:
+        """The file a frame came from (None for video frames)."""
+        return None
+
     @property
     def fps(self) -> Optional[float]:
         return None
@@ -94,18 +102,21 @@ class ImageSequence(FrameSource):
             raise ValueError("Pass exactly one of 'folder' or 'paths'.")
         if paths is None:
             paths = files.list_images(folder)
-            self.name = Path(folder).name
+            self.name = files.shoot_name(folder)
         else:
             paths = [str(p) for p in paths]
-            self.name = Path(paths[0]).parent.name if paths else "sequence"
+            self.name = files.shoot_name(Path(paths[0]).parent) if paths else "sequence"
         if not paths:
             raise FileNotFoundError(f"No JPEG/TIFF images found in {folder}")
 
         self.workers = workers
         self._pool: Optional[ThreadPoolExecutor] = None
 
+        self._exiftool_path = exiftool_path
+        self._info: Optional[Dict[str, files.FrameInfo]] = None
         if sort == "exif":
-            self._times = files.read_capture_times(paths, exiftool_path, workers)
+            self._info = files.read_frame_info(paths, exiftool_path, workers)
+            self._times = {p: fi.time for p, fi in self._info.items()}
             self.paths = files.sort_by_capture_time(paths, self._times)
             missing = sum(t is None for t in self._times.values())
             if missing:
@@ -138,10 +149,21 @@ class ImageSequence(FrameSource):
         for job in jobs:
             job.result()
 
+    def _ensure_info(self) -> Dict[str, files.FrameInfo]:
+        if self._info is None:
+            self._info = files.read_frame_info(self.paths, self._exiftool_path, self.workers)
+        return self._info
+
     def _ensure_times(self):
         if self._times is None:
-            self._times = files.read_capture_times(self.paths, workers=self.workers)
+            self._times = {p: fi.time for p, fi in self._ensure_info().items()}
         return self._times
+
+    def frame_info(self, index: int) -> Optional[files.FrameInfo]:
+        return self._ensure_info().get(self.paths[index])
+
+    def frame_path(self, index: int) -> Optional[str]:
+        return self.paths[index]
 
     def capture_time(self, index: int) -> Optional[datetime]:
         return self._ensure_times().get(self.paths[index])
@@ -204,6 +226,12 @@ class SubsetSource(FrameSource):
 
     def xmp(self, index: int) -> Optional[bytes]:
         return self.source.xmp(self.indices[index])
+
+    def frame_info(self, index: int) -> Optional[files.FrameInfo]:
+        return self.source.frame_info(self.indices[index])
+
+    def frame_path(self, index: int) -> Optional[str]:
+        return self.source.frame_path(self.indices[index])
 
     @property
     def fps(self) -> Optional[float]:

@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
@@ -66,6 +67,17 @@ def list_images(folder, extensions: Sequence[str] = IMAGE_EXTENSIONS) -> List[st
     return [str(p) for p in folder.iterdir() if p.is_file() and p.suffix.lower() in exts]
 
 
+def shoot_name(path) -> str:
+    """Name for a shoot: a Lightroom-style ``...\Shoot\export`` folder is called
+    ``Shoot``; any other folder or file uses its own name (files without extension)."""
+    p = Path(path)
+    if p.suffix and not p.is_dir():
+        return p.stem
+    if p.name.lower().startswith("export") and p.parent != p and p.parent.name:
+        return p.parent.name
+    return p.name
+
+
 def find_exiftool(explicit: Optional[str] = None) -> Optional[str]:
     """Locate exiftool: explicit path > $TIMELAPSE_EXIFTOOL > PATH > an exiftool-* folder next to this repo."""
     candidates = [explicit, os.environ.get("TIMELAPSE_EXIFTOOL"), shutil.which("exiftool")]
@@ -88,28 +100,81 @@ def _parse_exif_datetime(value) -> Optional[datetime]:
         return None
 
 
-def _pillow_capture_time(path: str) -> Optional[datetime]:
+def _with_subsec(dt: Optional[datetime], subsec) -> Optional[datetime]:
+    """Add EXIF SubSecTimeOriginal ("303" = 0.303 s) to a capture time."""
+    if dt is None or subsec in (None, ""):
+        return dt
+    digits = "".join(ch for ch in str(subsec) if ch.isdigit())
+    return dt.replace(microsecond=int((digits + "000000")[:6])) if digits else dt
+
+
+def _num(value) -> Optional[float]:
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class FrameInfo:
+    """Per-frame capture details read from EXIF (any field may be missing)."""
+
+    time: Optional[datetime] = None        # capture time, with sub-seconds when recorded
+    exposure: Optional[float] = None       # seconds
+    fnumber: Optional[float] = None
+    iso: Optional[float] = None
+    focal_length: Optional[float] = None   # mm
+    make: str = ""
+    model: str = ""
+    lens: str = ""
+
+
+_EXIFTOOL_TAGS = ["EXIF:DateTimeOriginal", "EXIF:CreateDate", "EXIF:SubSecTimeOriginal", "EXIF:ExposureTime",
+                  "EXIF:FNumber", "EXIF:ISO", "EXIF:FocalLength", "EXIF:Make", "EXIF:Model", "EXIF:LensModel"]
+
+
+def _info_from_exiftool(meta: dict) -> FrameInfo:
+    g = meta.get
+    return FrameInfo(
+        time=_with_subsec(_parse_exif_datetime(g("EXIF:DateTimeOriginal") or g("EXIF:CreateDate")),
+                          g("EXIF:SubSecTimeOriginal")),
+        exposure=_num(g("EXIF:ExposureTime")), fnumber=_num(g("EXIF:FNumber")), iso=_num(g("EXIF:ISO")),
+        focal_length=_num(g("EXIF:FocalLength")), make=str(g("EXIF:Make") or "").strip(),
+        model=str(g("EXIF:Model") or "").strip(), lens=str(g("EXIF:LensModel") or "").strip())
+
+
+def _pillow_frame_info(path: str) -> FrameInfo:
     try:
         with Image.open(path) as img:
             exif = img.getexif()
             sub = exif.get_ifd(EXIF_IFD_POINTER) if exif else {}
-            return _parse_exif_datetime(
-                sub.get(EXIF_DATETIME_ORIGINAL) or sub.get(EXIF_DATETIME_DIGITIZED) or exif.get(EXIF_DATETIME)
-            )
+            iso = sub.get(0x8827)
+            return FrameInfo(
+                time=_with_subsec(_parse_exif_datetime(sub.get(EXIF_DATETIME_ORIGINAL) or
+                                                       sub.get(EXIF_DATETIME_DIGITIZED) or exif.get(EXIF_DATETIME)),
+                                  sub.get(0x9291)),
+                exposure=_num(sub.get(0x829A)), fnumber=_num(sub.get(0x829D)),
+                iso=_num(iso[0] if isinstance(iso, tuple) else iso), focal_length=_num(sub.get(0x920A)),
+                make=str(exif.get(EXIF_MAKE) or "").strip("\x00 "), model=str(exif.get(272) or "").strip("\x00 "),
+                lens=str(sub.get(0xA434) or "").strip("\x00 "))
     except Exception:
-        return None
+        return FrameInfo()
 
 
-def read_capture_times(paths: Sequence[str], exiftool_path: Optional[str] = None,
-                       workers: int = 8) -> Dict[str, Optional[datetime]]:
-    """Return {path: capture datetime or None}.
+def _pillow_capture_time(path: str) -> Optional[datetime]:
+    return _pillow_frame_info(path).time
 
-    Uses exiftool (fast, one process for all files) when available, otherwise
-    reads EXIF with Pillow in parallel.
+
+def read_frame_info(paths: Sequence[str], exiftool_path: Optional[str] = None,
+                    workers: int = 8) -> Dict[str, FrameInfo]:
+    """Return {path: FrameInfo} for every frame.
+
+    Uses exiftool (one process for all files) when available, otherwise reads
+    EXIF with Pillow in parallel.
     """
-    times: Dict[str, Optional[datetime]] = {p: None for p in paths}
+    info: Dict[str, FrameInfo] = {p: FrameInfo() for p in paths}
     if not paths:
-        return times
+        return info
 
     exe = find_exiftool(exiftool_path)
     if exe is not None:
@@ -118,20 +183,33 @@ def read_capture_times(paths: Sequence[str], exiftool_path: Optional[str] = None
 
             lookup = {_norm(p): p for p in paths}
             with exiftool.ExifToolHelper(executable=exe) as et:
-                for meta in et.get_tags(list(paths), tags=["EXIF:DateTimeOriginal", "EXIF:CreateDate"]):
+                for meta in et.get_tags(list(paths), tags=_EXIFTOOL_TAGS):
                     original = lookup.get(_norm(meta.get("SourceFile", "")))
                     if original is not None:
-                        times[original] = _parse_exif_datetime(
-                            meta.get("EXIF:DateTimeOriginal") or meta.get("EXIF:CreateDate")
-                        )
-            return times
+                        info[original] = _info_from_exiftool(meta)
+            return info
         except Exception as exc:  # fall through to Pillow
             logger.warning("exiftool failed (%s); reading EXIF with Pillow instead.", exc)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for path, dt in zip(paths, pool.map(_pillow_capture_time, paths)):
-            times[path] = dt
-    return times
+        for path, fi in zip(paths, pool.map(_pillow_frame_info, paths)):
+            info[path] = fi
+    return info
+
+
+def read_capture_times(paths: Sequence[str], exiftool_path: Optional[str] = None,
+                       workers: int = 8) -> Dict[str, Optional[datetime]]:
+    """Return {path: capture datetime or None}."""
+    return {p: fi.time for p, fi in read_frame_info(paths, exiftool_path, workers).items()}
+
+
+def read_icc_profile(path) -> Optional[bytes]:
+    """The embedded ICC colour profile (e.g. ProPhoto RGB from a Lightroom export), if any."""
+    try:
+        with Image.open(path) as img:
+            return img.info.get("icc_profile") or None
+    except Exception:
+        return None
 
 
 def sort_by_capture_time(paths: Sequence[str], times: Dict[str, Optional[datetime]]) -> List[str]:
@@ -350,37 +428,87 @@ def resolve_output_path(path, overwrite: str = "increment") -> Path:
         n += 1
 
 
-def save_image(path, img: np.ndarray, xmp: Optional[bytes] = None,
-               timestamp: Optional[datetime] = None, jpeg_quality: int = 100) -> Path:
-    """Save a float 0-1 (or uint16) image. TIFF -> 16-bit (with optional XMP), JPEG -> 8-bit (with EXIF dates).
+def _jpeg_exif(meta, timestamp: Optional[datetime]) -> "Image.Exif":
+    """EXIF block for a JPEG written by Pillow (the no-exiftool path)."""
+    exif = Image.Exif()
+    sub = exif.get_ifd(EXIF_IFD_POINTER)
+    if timestamp is not None:
+        stamp = timestamp.strftime("%Y:%m:%d %H:%M:%S")
+        exif[EXIF_DATETIME] = stamp
+        sub[EXIF_DATETIME_ORIGINAL] = stamp
+        sub[EXIF_DATETIME_DIGITIZED] = stamp
+    if meta is not None:
+        from .metadata import software_name
 
-    ``timestamp`` is written into JPEG EXIF and used as the file's modified time
-    for both formats.
+        cam = meta.camera
+        exif[270] = meta.description
+        exif[305] = software_name()
+        if cam.make:
+            exif[EXIF_MAKE] = cam.make
+        if cam.model:
+            exif[272] = cam.model
+        for tag, value in ((0x829A, cam.exposure), (0x829D, cam.fnumber), (0x920A, cam.focal_length)):
+            if value:
+                sub[tag] = float(value)
+        if cam.iso:
+            sub[0x8827] = int(cam.iso)
+        if cam.lens:
+            sub[0xA434] = cam.lens
+        sub[0x9286] = b"ASCII\x00\x00\x00" + meta.comment_json.encode("ascii", "replace")
+    return exif
+
+
+def save_image(path, img: np.ndarray, xmp: Optional[bytes] = None,
+               timestamp: Optional[datetime] = None, jpeg_quality: int = 100, metadata=None) -> Path:
+    """Save a float 0-1 (or uint16) image: TIFF -> 16-bit, JPEG -> 8-bit.
+
+    ``metadata`` (a :class:`timelapse_engine.metadata.OutputMetadata`) adds the
+    title/caption, camera and lens EXIF, the source's ICC colour profile and
+    Lightroom XMP; see :mod:`timelapse_engine.metadata`. ``timestamp`` (default:
+    the metadata's capture time) becomes the capture date and file modified time.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     img = _squeeze_channels(img)
     ext = path.suffix.lower()
+    if timestamp is None and metadata is not None:
+        timestamp = metadata.capture_time
+    use_exiftool = False
+    if metadata is not None:
+        from .metadata import exiftool_available
+
+        use_exiftool = exiftool_available()
+        xmp = None if use_exiftool else (xmp or metadata.xmp)  # exiftool copies XMP itself
+    icc = metadata.icc if metadata is not None else None
 
     if ext in TIFF_EXTENSIONS:
         data = to_uint16(img)
         extratags = [(TIFF_XMP_TAG, "B", len(xmp), xmp, True)] if xmp else []
+        kwargs = {}
+        if metadata is not None:
+            from .metadata import software_name
+
+            kwargs.update(description=metadata.description, software=software_name())
+            for tag, value in ((EXIF_MAKE, metadata.camera.make), (272, metadata.camera.model)):
+                if value:
+                    extratags.append((tag, "s", 0, value, True))
         tifffile.imwrite(path, data, photometric="rgb" if data.ndim == 3 else "minisblack",
-                         extratags=extratags)
+                         metadata=None,  # no tifffile JSON ({"shape": ...}) in ImageDescription
+                         iccprofile=icc, datetime=timestamp, extratags=extratags, **kwargs)
     elif ext in (".jpg", ".jpeg"):
         pil = Image.fromarray(to_uint8(img))
-        exif = Image.Exif()
-        exif[EXIF_MAKE] = "timelapse_engine"
-        if timestamp is not None:
-            stamp = timestamp.strftime("%Y:%m:%d %H:%M:%S")
-            exif[EXIF_DATETIME] = stamp
-            sub = exif.get_ifd(EXIF_IFD_POINTER)
-            sub[EXIF_DATETIME_ORIGINAL] = stamp
-            sub[EXIF_DATETIME_DIGITIZED] = stamp
-        pil.save(path, format="JPEG", quality=jpeg_quality, subsampling=0, exif=exif)
+        save_kwargs = {"icc_profile": icc} if icc else {}
+        if xmp:
+            save_kwargs["xmp"] = xmp
+        pil.save(path, format="JPEG", quality=jpeg_quality, subsampling=0,
+                 exif=_jpeg_exif(metadata, timestamp), **save_kwargs)
     else:
         raise ValueError(f"Unsupported output format: {ext} (use .tiff or .jpg)")
 
+    if use_exiftool:
+        from .metadata import write_with_exiftool
+
+        write_with_exiftool(path, metadata, timestamp)
     if timestamp is not None:
         posix = timestamp.timestamp()
         os.utime(path, (posix, posix))

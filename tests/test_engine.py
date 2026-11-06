@@ -184,7 +184,7 @@ class CaptureSink(te.outputs.Sink):
     def __init__(self):
         self.frames = []
 
-    def write(self, frame):
+    def write(self, frame, meta=None):
         self.frames.append(te.backend.asnumpy(frame).copy())
 
 
@@ -394,6 +394,106 @@ def test_files_end_to_end():
         else:
             raise AssertionError("expected SequenceMismatchError")
         seq.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def write_camera_sequence(folder, n=12, start=datetime(2025, 7, 1, 21, 0, 0), interval=2.5):
+    """JPEGs with full camera EXIF: make/model/lens, 1/250 s, f/2.8, ISO 800, 24 mm, sub-second times, sRGB ICC."""
+    from PIL import ImageCms
+
+    icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    rng = np.random.default_rng(4)
+    for i in range(n):
+        t = start + timedelta(seconds=interval * i)
+        exif = Image.Exif()
+        exif[271], exif[272] = "Panasonic", "DC-GX9"
+        sub = exif.get_ifd(files.EXIF_IFD_POINTER)
+        sub[files.EXIF_DATETIME_ORIGINAL] = t.strftime("%Y:%m:%d %H:%M:%S")
+        sub[0x9291] = f"{t.microsecond // 1000:03d}"           # SubSecTimeOriginal
+        sub[0x829A], sub[0x829D], sub[0x920A] = 1 / 250, 2.8, 24.0
+        sub[0x8827] = 800
+        sub[0xA434] = "LUMIX G 20/F1.7 II"
+        img = Image.fromarray((rng.random((H, W, 3)) * 255).astype(np.uint8))
+        img.save(Path(folder) / f"P{i:04d}.jpg", quality=95, exif=exif, icc_profile=icc)
+    return icc
+
+
+def _read_meta(path):
+    """(ImageDescription, Make, Model, exif sub-IFD, ICC, DateTimeOriginal) read back with Pillow."""
+    with Image.open(path) as im:
+        exif = im.getexif()
+        sub = exif.get_ifd(files.EXIF_IFD_POINTER)
+        return (exif.get(270), exif.get(271), exif.get(272), sub, im.info.get("icc_profile"),
+                files._pillow_capture_time(str(path)))
+
+
+def _check_outputs(tmp, icc, use_exiftool):
+    import json
+
+    seq = te.ImageSequence(tmp / "Shoot" / "export")
+    assert seq.name == "Shoot"
+    info = seq.frame_info(0)
+    assert info.exposure == 1 / 250 and info.iso == 800 and info.lens == "LUMIX G 20/F1.7 II"
+    out = tmp / ("out_et" if use_exiftool else "out_plain")
+    for ext in ("tiff", "jpg"):
+        path = te.stack_to_file(te.SubsetSource(seq, range(2, 10)), "maximum", out, ext=ext)
+        desc, make, model, sub, got_icc, when = _read_meta(path)
+        assert desc.startswith("Maximum stack of 8 frames | source frames 3-10 of 12 from Shoot"), desc
+        assert "1/250 s exposures every 2.5 s" in desc and "total exposure 1/31 s" in desc, desc
+        assert "Panasonic DC-GX9" in desc and "24 mm f/2.8 ISO 800" in desc, desc
+        assert '"shape"' not in desc
+        assert (make, model) == ("Panasonic", "DC-GX9")
+        assert got_icc == icc, "colour profile not copied"
+        assert when == datetime(2025, 7, 1, 21, 0, 22) + timedelta(minutes=1), when  # last frame + 1 min
+        if ext == "jpg" or use_exiftool:
+            assert sub.get(0xA434) == "LUMIX G 20/F1.7 II" and float(sub.get(0x829A)) == 1 / 250
+            comment = sub.get(0x9286)
+            comment = comment.decode("ascii", "ignore") if isinstance(comment, bytes) else str(comment)
+            facts = json.loads(comment[comment.index("{"):])
+            assert facts["frames"] == 8 and facts["interval_s"] == 2.5 and facts["process"] == "maximum"
+    frames = te.render_frames(seq, "average", out / "seq", blend=4, step=4, ext="jpg")
+    desc, *_, when = _read_meta(frames[1])
+    assert desc.startswith("Average blend of 4 frames | source frames 5-8 of 12"), desc
+    assert when == datetime(2025, 7, 1, 21, 0, 17), when  # last frame of that window (seconds precision)
+    seq.close()
+
+
+def test_output_metadata():
+    from timelapse_engine import metadata
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        (tmp / "Shoot" / "export").mkdir(parents=True)
+        icc = write_camera_sequence(tmp / "Shoot" / "export")
+        if metadata.exiftool_available():
+            _check_outputs(tmp, icc, use_exiftool=True)
+        original = files.find_exiftool
+        files.find_exiftool = lambda explicit=None: None  # the no-exiftool fallback
+        try:
+            _check_outputs(tmp, icc, use_exiftool=False)
+        finally:
+            files.find_exiftool = original
+    finally:
+        metadata.close_exiftool()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_video_metadata():
+    import subprocess
+
+    if shutil.which("ffmpeg") is None:
+        return
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        (tmp / "Shoot" / "export").mkdir(parents=True)
+        write_camera_sequence(tmp / "Shoot" / "export")
+        outs = te.render_video(tmp / "Shoot" / "export", "average", tmp, blend=4, step=2, master=None,
+                               preview_1080p=True)
+        tags = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json", str(outs[0])],
+                              capture_output=True, text=True, check=True).stdout
+        assert "Average rolling blend of 4 frames per output frame, step 2" in tags, tags
+        assert "1/250 s exposures every 2.5 s" in tags and "creation_time" in tags
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
