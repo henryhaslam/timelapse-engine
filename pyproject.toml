@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "timelapse-engine"
+version = "0.1.0"
+description = "Stacking and rolling-window blending for large timelapse sequences and video"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "opencv-python",
+    "pillow",
+    "tifffile",
+    "imageio[ffmpeg]",
+    "pyexiftool",
+    "piexif",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda12x"]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["timelapse_engine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

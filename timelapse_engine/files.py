@@ -1,0 +1,300 @@
+"""Image file helpers: loading, sorting, validation, metadata and saving.
+
+All pixel data inside the engine is float32 in the range 0.0 - 1.0 with shape
+(H, W, C). Conversion to/from 8 or 16 bit only happens here.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence
+
+import numpy as np
+import tifffile
+from PIL import Image
+
+from .progress import logger
+
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".tif", ".tiff")
+TIFF_EXTENSIONS = (".tif", ".tiff")
+
+EXIF_DATETIME_ORIGINAL = 36867
+EXIF_DATETIME_DIGITIZED = 36868
+EXIF_DATETIME = 306
+EXIF_MAKE = 271
+EXIF_IFD_POINTER = 0x8769
+TIFF_XMP_TAG = 700
+
+
+class SequenceMismatchError(ValueError):
+    """Raised when frames in a sequence differ in size or bit depth."""
+
+    def __init__(self, mismatches: List[tuple]):
+        self.mismatches = mismatches
+        lines = "\n".join(f" - {os.path.basename(p)} ({info})" for p, info in mismatches[:50])
+        more = f"\n ... and {len(mismatches) - 50} more" if len(mismatches) > 50 else ""
+        super().__init__(f"{len(mismatches)} frame(s) differ from the first frame:\n{lines}{more}")
+
+
+# ---------------------------------------------------------------------------
+# Listing and sorting
+# ---------------------------------------------------------------------------
+
+def natural_sort_key(path) -> list:
+    """Sort key that orders 'img2' before 'img10'."""
+    name = os.path.basename(str(path))
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def _norm(path) -> str:
+    """Normalise a path so exiftool's forward-slash paths match glob's backslash paths."""
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def list_images(folder, extensions: Sequence[str] = IMAGE_EXTENSIONS) -> List[str]:
+    """Return every image in ``folder`` (non-recursive, case-insensitive extension match)."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise NotADirectoryError(f"Not a folder: {folder}")
+    exts = tuple(e.lower() for e in extensions)
+    return [str(p) for p in folder.iterdir() if p.is_file() and p.suffix.lower() in exts]
+
+
+def find_exiftool(explicit: Optional[str] = None) -> Optional[str]:
+    """Locate exiftool: explicit path > $TIMELAPSE_EXIFTOOL > PATH > an exiftool-* folder next to this repo."""
+    candidates = [explicit, os.environ.get("TIMELAPSE_EXIFTOOL"), shutil.which("exiftool")]
+    repo_parent = Path(__file__).resolve().parents[2]
+    candidates += [str(p) for p in sorted(repo_parent.glob("exiftool-*/exiftool.exe"))]
+    for c in candidates:
+        if c and Path(c).is_file():
+            return c
+    return None
+
+
+def _parse_exif_datetime(value) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "ignore")
+    try:
+        return datetime.strptime(str(value).strip("\x00 ")[:19], "%Y:%m:%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _pillow_capture_time(path: str) -> Optional[datetime]:
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            sub = exif.get_ifd(EXIF_IFD_POINTER) if exif else {}
+            return _parse_exif_datetime(
+                sub.get(EXIF_DATETIME_ORIGINAL) or sub.get(EXIF_DATETIME_DIGITIZED) or exif.get(EXIF_DATETIME)
+            )
+    except Exception:
+        return None
+
+
+def read_capture_times(paths: Sequence[str], exiftool_path: Optional[str] = None,
+                       workers: int = 8) -> Dict[str, Optional[datetime]]:
+    """Return {path: capture datetime or None}.
+
+    Uses exiftool (fast, one process for all files) when available, otherwise
+    reads EXIF with Pillow in parallel.
+    """
+    times: Dict[str, Optional[datetime]] = {p: None for p in paths}
+    if not paths:
+        return times
+
+    exe = find_exiftool(exiftool_path)
+    if exe is not None:
+        try:
+            import exiftool
+
+            lookup = {_norm(p): p for p in paths}
+            with exiftool.ExifToolHelper(executable=exe) as et:
+                for meta in et.get_tags(list(paths), tags=["EXIF:DateTimeOriginal", "EXIF:CreateDate"]):
+                    original = lookup.get(_norm(meta.get("SourceFile", "")))
+                    if original is not None:
+                        times[original] = _parse_exif_datetime(
+                            meta.get("EXIF:DateTimeOriginal") or meta.get("EXIF:CreateDate")
+                        )
+            return times
+        except Exception as exc:  # fall through to Pillow
+            logger.warning("exiftool failed (%s); reading EXIF with Pillow instead.", exc)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for path, dt in zip(paths, pool.map(_pillow_capture_time, paths)):
+            times[path] = dt
+    return times
+
+
+def sort_by_capture_time(paths: Sequence[str], times: Dict[str, Optional[datetime]]) -> List[str]:
+    """Sort by EXIF capture time; ties and files without a date fall back to natural filename order."""
+    return sorted(paths, key=lambda p: (times.get(p) is None, times.get(p) or datetime.min, natural_sort_key(p)))
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def _header_signature(path: str):
+    """((width, height), bit depth, channel count) read from the file header only."""
+    if path.lower().endswith(TIFF_EXTENSIONS):
+        # Pillow can't describe 16-bit RGB TIFFs, so read the header with tifffile.
+        with tifffile.TiffFile(path) as tif:
+            page = tif.pages[0]
+            return (page.imagewidth, page.imagelength), f"{page.bitspersample}bit", page.samplesperpixel
+    with Image.open(path) as img:
+        return img.size, "8bit", len(img.getbands())
+
+
+def validate_sequence(paths: Sequence[str], workers: int = 8) -> None:
+    """Raise :class:`SequenceMismatchError` if any frame differs from the first in size, depth or channels."""
+    if not paths:
+        return
+    reference = _header_signature(paths[0])
+
+    def check(path):
+        try:
+            sig = _header_signature(path)
+            if sig != reference:
+                return path, f"size {sig[0]}, {sig[1]}, {sig[2]} channel(s); expected {reference[0]}, {reference[1]}, {reference[2]}"
+        except Exception as exc:
+            return path, f"unreadable: {exc}"
+        return None
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        mismatches = [m for m in pool.map(check, paths) if m is not None]
+    if mismatches:
+        raise SequenceMismatchError(mismatches)
+    logger.info("All %d frames match: %s, %s, %d channel(s).", len(paths), reference[0], reference[1], reference[2])
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+def to_float(img: np.ndarray) -> np.ndarray:
+    """Convert any integer or float image to float32 in 0-1 with shape (H, W, C)."""
+    if np.issubdtype(img.dtype, np.integer):
+        out = img.astype(np.float32) / np.float32(np.iinfo(img.dtype).max)
+    else:
+        out = img.astype(np.float32, copy=False)
+    if out.ndim == 2:
+        out = out[:, :, None]
+    elif out.ndim == 3 and out.shape[2] == 4:
+        out = out[:, :, :3]  # drop alpha
+    return out
+
+
+def load_image(path) -> np.ndarray:
+    """Load a JPEG or TIFF as float32 0-1, (H, W, C).
+
+    Scaling is based on the file's real dtype, so 8-bit TIFFs are scaled by
+    255 and 16-bit TIFFs by 65535.
+    """
+    path = str(path)
+    if path.lower().endswith(TIFF_EXTENSIONS):
+        img = tifffile.imread(path)
+        if img.ndim == 3 and img.shape[0] in (3, 4) and img.shape[-1] not in (3, 4):
+            img = np.moveaxis(img, 0, -1)  # separate colour planes -> interleaved
+    else:
+        with Image.open(path) as im:
+            img = np.asarray(im.convert("RGB") if im.mode not in ("RGB", "L") else im)
+    return to_float(img)
+
+
+def read_xmp(path) -> Optional[bytes]:
+    """Return the embedded XMP packet (e.g. Lightroom develop settings), if any."""
+    try:
+        with Image.open(path) as img:
+            xmp = img.info.get("xmp") or img.info.get("XML:com.adobe.xmp")
+        if xmp is None and str(path).lower().endswith(TIFF_EXTENSIONS):
+            with tifffile.TiffFile(path) as tif:
+                tag = tif.pages[0].tags.get(TIFF_XMP_TAG)
+                xmp = tag.value if tag is not None else None
+        if isinstance(xmp, str):
+            xmp = xmp.encode("utf-8")
+        return xmp
+    except Exception as exc:
+        logger.debug("Could not read XMP from %s: %s", path, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Saving
+# ---------------------------------------------------------------------------
+
+def to_uint8(img: np.ndarray) -> np.ndarray:
+    return (np.clip(img, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+
+def to_uint16(img: np.ndarray) -> np.ndarray:
+    return (np.clip(img, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
+
+
+def _squeeze_channels(img: np.ndarray) -> np.ndarray:
+    return img[:, :, 0] if img.ndim == 3 and img.shape[2] == 1 else img
+
+
+def resolve_output_path(path, overwrite: str = "increment") -> Path:
+    """Decide what to do when ``path`` exists.
+
+    overwrite: "overwrite" - replace it; "increment" - use name_1, name_2...;
+    "error" - raise FileExistsError.
+    """
+    path = Path(path)
+    if not path.exists() or overwrite == "overwrite":
+        return path
+    if overwrite == "error":
+        raise FileExistsError(f"Output already exists: {path}")
+    if overwrite != "increment":
+        raise ValueError(f"Unknown overwrite policy: {overwrite!r}")
+    n = 1
+    while True:
+        candidate = path.with_name(f"{path.stem}_{n}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def save_image(path, img: np.ndarray, xmp: Optional[bytes] = None,
+               timestamp: Optional[datetime] = None, jpeg_quality: int = 100) -> Path:
+    """Save a float 0-1 image. TIFF -> 16-bit (with optional XMP), JPEG -> 8-bit (with EXIF dates).
+
+    ``timestamp`` is written into JPEG EXIF and used as the file's modified time
+    for both formats.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img = _squeeze_channels(img)
+    ext = path.suffix.lower()
+
+    if ext in TIFF_EXTENSIONS:
+        data = to_uint16(img)
+        extratags = [(TIFF_XMP_TAG, "B", len(xmp), xmp, True)] if xmp else []
+        tifffile.imwrite(path, data, photometric="rgb" if data.ndim == 3 else "minisblack",
+                         extratags=extratags)
+    elif ext in (".jpg", ".jpeg"):
+        pil = Image.fromarray(to_uint8(img))
+        exif = Image.Exif()
+        exif[EXIF_MAKE] = "timelapse_engine"
+        if timestamp is not None:
+            stamp = timestamp.strftime("%Y:%m:%d %H:%M:%S")
+            exif[EXIF_DATETIME] = stamp
+            sub = exif.get_ifd(EXIF_IFD_POINTER)
+            sub[EXIF_DATETIME_ORIGINAL] = stamp
+            sub[EXIF_DATETIME_DIGITIZED] = stamp
+        pil.save(path, format="JPEG", quality=jpeg_quality, subsampling=0, exif=exif)
+    else:
+        raise ValueError(f"Unsupported output format: {ext} (use .tiff or .jpg)")
+
+    if timestamp is not None:
+        posix = timestamp.timestamp()
+        os.utime(path, (posix, posix))
+    return path
