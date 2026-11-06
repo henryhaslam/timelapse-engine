@@ -11,9 +11,10 @@ Two-pass processors (``two_pass = True``) are fed every frame a second time:
 
     proc.begin_second_pass(); proc.update_second_pass(batch) ...; proc.result()
 
-``reset()`` must leave the processor ready for a fresh run, and ``update``
-does all of the accumulation (there is no separate "init with first batch"
-step, so no batch is ever counted twice).
+Processors with ``gpu = True`` are written against the NumPy API and work
+unchanged on CuPy arrays: the engine hands them GPU batches when CuPy is
+available, and their state stays on the GPU. ``result()`` may return a CuPy
+array; use ``backend.asnumpy`` (the engine does this for you).
 """
 
 from __future__ import annotations
@@ -23,16 +24,7 @@ from typing import Dict, Optional, Type
 import cv2
 import numpy as np
 
-from .progress import logger
-
-try:  # CuPy is optional; GPU processors fall back to NumPy without it.
-    import cupy as cp
-
-    cp.zeros(1)  # fail early if CUDA isn't usable
-    HAS_CUPY = True
-except Exception:  # pragma: no cover - depends on machine
-    cp = None
-    HAS_CUPY = False
+from .backend import HAS_CUPY, asnumpy, cp, xp_of
 
 
 def normalise_threshold(value: float) -> float:
@@ -51,13 +43,49 @@ def _to_gray_u8(frame: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(np.ascontiguousarray(u8[:, :, :3]), cv2.COLOR_RGB2GRAY)
 
 
-def _hsv_to_rgb_float(hue_0_179: np.ndarray, value_0_1: np.ndarray) -> np.ndarray:
+def _hsv_to_rgb_float(hue_0_179, value_0_1) -> np.ndarray:
     """Build a fully saturated colour image from an OpenCV hue map and a brightness map."""
-    hue = np.clip(hue_0_179, 0, 179).astype(np.uint8)
-    val = (np.clip(value_0_1, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    hue = np.clip(asnumpy(hue_0_179), 0, 179).astype(np.uint8)
+    val = (np.clip(asnumpy(value_0_1), 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
     sat = np.full_like(hue, 255)
     rgb = cv2.cvtColor(cv2.merge([hue, sat, val]), cv2.COLOR_HSV2RGB)
     return rgb.astype(np.float32) / 255.0
+
+
+def _channel_max(x):
+    """Max over the last (colour) axis. Element-wise per channel because CuPy's
+    reduction over a tiny innermost axis is ~15x slower than this."""
+    xp = xp_of(x)
+    out = x[..., 0]
+    for c in range(1, x.shape[-1]):
+        out = xp.maximum(out, x[..., c])
+    return out
+
+
+def _channel_mean(x):
+    """Mean over the last (colour) axis (see _channel_max for why it's written this way)."""
+    out = x[..., 0].copy()
+    for c in range(1, x.shape[-1]):
+        out += x[..., c]
+    out *= 1.0 / x.shape[-1]
+    return out
+
+
+def _normalise_peak(img, floor: float = 1e-6):
+    """Scale so the brightest pixel is 1. Below ``floor`` the image is treated as
+    all-zero, so rounding noise in a static scene isn't stretched to full white."""
+    xp = xp_of(img)
+    peak = float(img.max())
+    if peak < floor:
+        return xp.zeros(img.shape, xp.float32)
+    return (img / peak).astype(xp.float32)
+
+
+def _batch_sum(batch):
+    """Sum a batch over frames: float32 within the batch, float64 across batches
+    (consumer GPUs are very slow at float64 maths, but fine at float64 adds)."""
+    xp = xp_of(batch)
+    return batch.sum(axis=0, dtype=xp.float32).astype(xp.float64)
 
 
 class Processor:
@@ -65,22 +93,85 @@ class Processor:
 
     name = "base"
     two_pass = False
+    gpu = True
     description = ""
+    state_frames = 2.0  # memory held between updates, in units of one float32 frame
+
+    def state_bytes(self, frame_shape) -> int:
+        """Device memory the processor's running state needs (used to size chunks)."""
+        return int(self.state_frames * np.prod(frame_shape) * 4)
+
+    def stored_bytes(self, n_frames: int, frame_shape) -> int:
+        """Host RAM for processors that must keep every frame (median, mode)."""
+        return 0
 
     def reset(self) -> None:
         raise NotImplementedError
 
-    def update(self, batch: np.ndarray) -> None:
+    def update(self, batch) -> None:
         raise NotImplementedError
 
-    def result(self) -> np.ndarray:
+    def result(self):
         raise NotImplementedError
 
     def begin_second_pass(self) -> None:
         pass
 
-    def update_second_pass(self, batch: np.ndarray) -> None:
+    def update_second_pass(self, batch) -> None:
         pass
+
+    # Optional sliding-window support: processors that can *remove* a frame
+    # (running sums) set ``sliding = True`` and implement the three methods
+    # below on raw (integer) frames. Rolling-window renders then cost
+    # ``step`` frames per output instead of ``blend`` frames.
+    sliding = False
+
+    def window_add(self, raw_frame) -> None:
+        raise NotImplementedError
+
+    def window_remove(self, raw_frame) -> None:
+        raise NotImplementedError
+
+    def window_result(self, scale: float):
+        raise NotImplementedError
+
+
+class _RunningSums:
+    """Exact running sums of raw frames (and optionally their squares).
+
+    Integer frames are summed in int64, so adding and later subtracting a frame
+    leaves no rounding error behind however many windows slide past.
+    """
+
+    def __init__(self, squares: bool):
+        self.squares = squares
+        self.clear()
+
+    def clear(self):
+        self.total = self.total_sq = None
+        self.count = 0
+
+    def _acc_dtype(self, xp, frame):
+        return xp.int64 if np.issubdtype(frame.dtype, np.integer) else xp.float64
+
+    def add(self, frame, sign: int = 1):
+        xp = xp_of(frame)
+        if self.total is None:
+            self.total = xp.zeros(frame.shape, self._acc_dtype(xp, frame))
+            if self.squares:
+                self.total_sq = xp.zeros(frame.shape, self._acc_dtype(xp, frame))
+        f = frame.astype(self.total.dtype)
+        if sign > 0:
+            self.total += f
+        else:
+            self.total -= f
+        if self.squares:
+            f *= f
+            if sign > 0:
+                self.total_sq += f
+            else:
+                self.total_sq -= f
+        self.count += sign
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +181,8 @@ class Processor:
 class AverageProcessor(Processor):
     name = "average"
     description = "Mean of all frames (long-exposure look)."
+    state_frames = 4.0
+    sliding = True
 
     def __init__(self):
         self.reset()
@@ -97,9 +190,20 @@ class AverageProcessor(Processor):
     def reset(self):
         self.total = None
         self.count = 0
+        self.window = _RunningSums(squares=False)
+
+    def window_add(self, raw_frame):
+        self.window.add(raw_frame, +1)
+
+    def window_remove(self, raw_frame):
+        self.window.add(raw_frame, -1)
+
+    def window_result(self, scale):
+        w = self.window
+        return (w.total * (scale / w.count)).astype(np.float32)
 
     def update(self, batch):
-        s = batch.sum(axis=0, dtype=np.float64)
+        s = _batch_sum(batch)
         self.total = s if self.total is None else self.total + s
         self.count += batch.shape[0]
 
@@ -119,7 +223,7 @@ class MaximumProcessor(Processor):
 
     def update(self, batch):
         m = batch.max(axis=0)
-        self.image = m if self.image is None else np.maximum(self.image, m)
+        self.image = m if self.image is None else xp_of(m).maximum(self.image, m)
 
     def result(self):
         return self.image
@@ -137,7 +241,7 @@ class MinimumProcessor(Processor):
 
     def update(self, batch):
         m = batch.min(axis=0)
-        self.image = m if self.image is None else np.minimum(self.image, m)
+        self.image = m if self.image is None else xp_of(m).minimum(self.image, m)
 
     def result(self):
         return self.image
@@ -145,7 +249,11 @@ class MinimumProcessor(Processor):
 
 class MedianProcessor(Processor):
     name = "median"
+    gpu = False
     description = "Median per pixel (removes transient objects). Holds every frame in RAM as 16-bit."
+
+    def stored_bytes(self, n_frames, frame_shape):
+        return int(n_frames * np.prod(frame_shape) * 2 * 2)  # frames + np.median's working copy
 
     def __init__(self):
         self.reset()
@@ -164,7 +272,11 @@ class MedianProcessor(Processor):
 
 class ModeProcessor(Processor):
     name = "mode"
+    gpu = False
     description = "Most common 8-bit value per pixel. Holds every frame in RAM as 8-bit."
+
+    def stored_bytes(self, n_frames, frame_shape):
+        return int(n_frames * np.prod(frame_shape) * 4)  # frames + scipy's sort/count temporaries
 
     def __init__(self):
         self.reset()
@@ -190,6 +302,7 @@ class ModeProcessor(Processor):
 class TemporalContrastProcessor(Processor):
     name = "temporal_contrast"
     description = "(max - min) / (max + min) per pixel: how much each pixel changed relative to its brightness."
+    state_frames = 4.0
 
     def __init__(self):
         self.reset()
@@ -199,18 +312,22 @@ class TemporalContrastProcessor(Processor):
         self.lo = None
 
     def update(self, batch):
+        xp = xp_of(batch)
         hi, lo = batch.max(axis=0), batch.min(axis=0)
-        self.hi = hi if self.hi is None else np.maximum(self.hi, hi)
-        self.lo = lo if self.lo is None else np.minimum(self.lo, lo)
+        self.hi = hi if self.hi is None else xp.maximum(self.hi, hi)
+        self.lo = lo if self.lo is None else xp.minimum(self.lo, lo)
 
     def result(self):
-        tce = (self.hi - self.lo) / (self.hi + self.lo + 1e-6)
-        return np.clip(tce, 0.0, 1.0).astype(np.float32)
+        xp = xp_of(self.hi)
+        tce = (self.hi - self.lo) / (self.hi + self.lo + xp.float32(1e-6))
+        return xp.clip(tce, 0.0, 1.0).astype(xp.float32)
 
 
 class TemporalStdProcessor(Processor):
     name = "temporal_std"
     description = "Standard deviation per pixel, normalised so the most variable pixel is white."
+    state_frames = 8.0
+    sliding = True
 
     def __init__(self):
         self.reset()
@@ -219,10 +336,30 @@ class TemporalStdProcessor(Processor):
         self.total = None
         self.total_sq = None
         self.count = 0
+        self.window = _RunningSums(squares=True)
+
+    def window_add(self, raw_frame):
+        self.window.add(raw_frame, +1)
+
+    def window_remove(self, raw_frame):
+        self.window.add(raw_frame, -1)
+
+    def window_result(self, scale):
+        w = self.window
+        xp = xp_of(w.total)
+        n = w.count
+        if w.total.dtype == xp.int64:
+            # n*Σx² - (Σx)² is exact in integers, so a static pixel gets exactly 0.
+            var = (n * w.total_sq - w.total * w.total) * (scale * scale / (n * n))
+        else:
+            mean = w.total / n
+            var = w.total_sq / n - mean * mean
+        return _normalise_peak(xp.sqrt(xp.maximum(var, 0.0)))
 
     def update(self, batch):
-        b = batch.astype(np.float64)
-        s, sq = b.sum(axis=0), np.square(b).sum(axis=0)
+        # float64 here: E[x²] - E[x]² cancels badly in float32 (a static pixel would get noise)
+        b = batch.astype(xp_of(batch).float64)
+        s, sq = b.sum(axis=0), (b * b).sum(axis=0)
         if self.total is None:
             self.total, self.total_sq = s, sq
         else:
@@ -231,15 +368,15 @@ class TemporalStdProcessor(Processor):
         self.count += batch.shape[0]
 
     def result(self):
+        xp = xp_of(self.total)
         mean = self.total / self.count
-        std = np.sqrt(np.maximum(self.total_sq / self.count - mean * mean, 0.0))
-        peak = std.max()
-        return (std / peak if peak > 0 else std).astype(np.float32)
+        return _normalise_peak(xp.sqrt(xp.maximum(self.total_sq / self.count - mean * mean, 0.0)))
 
 
 class TemporalGradientProcessor(Processor):
     name = "temporal_gradient"
     description = "Sum of frame-to-frame changes, normalised and auto-brightened."
+    state_frames = 3.0
 
     def __init__(self, target_mean: float = 100.0 / 255.0):
         self.target_mean = target_mean
@@ -250,19 +387,22 @@ class TemporalGradientProcessor(Processor):
         self.accum = None
 
     def update(self, batch):
-        for frame in batch:
-            if self.prev is None:
-                self.accum = np.zeros_like(frame)
-            else:
-                self.accum += np.abs(frame - self.prev)
-            self.prev = frame
+        xp = xp_of(batch)
+        if self.accum is None:
+            self.accum = xp.zeros(batch.shape[1:], xp.float32)
+        else:
+            self.accum += xp.abs(batch[0] - self.prev)
+        if batch.shape[0] > 1:
+            self.accum += xp.abs(xp.diff(batch, axis=0)).sum(axis=0)
+        self.prev = batch[-1].copy()
 
     def result(self):
-        out = self.accum / (self.accum.max() + 1e-6)
-        mean = out.mean()
+        xp = xp_of(self.accum)
+        out = self.accum / (float(self.accum.max()) + 1e-6)
+        mean = float(out.mean())
         if mean < self.target_mean:
-            out = out * (self.target_mean / (mean + 1e-6))
-        return np.clip(out, 0.0, 1.0).astype(np.float32)
+            out *= self.target_mean / (mean + 1e-6)
+        return xp.clip(out, 0.0, 1.0).astype(xp.float32)
 
 
 class TemporalHueMotionProcessor(Processor):
@@ -280,22 +420,31 @@ class TemporalHueMotionProcessor(Processor):
         self.frame_index = 0
 
     def update(self, batch):
-        for frame in batch:
-            if self.prev is None:
-                h, w = frame.shape[:2]
-                self.hue_accum = np.zeros((h, w), np.float32)
-                self.motion_accum = np.zeros((h, w), np.float32)
-            else:
-                diff = np.abs(frame - self.prev).mean(axis=2)
-                hue = (self.frame_index % self.hue_period) * (179.0 / self.hue_period)
-                self.hue_accum += diff * hue
-                self.motion_accum += diff
-            self.prev = frame
-            self.frame_index += 1
+        xp = xp_of(batch)
+        n = batch.shape[0]
+        diffs = []
+        if self.prev is None:
+            self.hue_accum = xp.zeros(batch.shape[1:3], xp.float32)
+            self.motion_accum = xp.zeros(batch.shape[1:3], xp.float32)
+            first = self.frame_index + 1  # the very first frame has nothing to compare with
+        else:
+            diffs.append(_channel_mean(xp.abs(batch[0] - self.prev))[None])
+            first = self.frame_index
+        if n > 1:
+            diffs.append(_channel_mean(xp.abs(xp.diff(batch, axis=0))))
+        if diffs:
+            d = xp.concatenate(diffs) if len(diffs) > 1 else diffs[0]
+            idx = xp.arange(first, self.frame_index + n)
+            hue = (idx % self.hue_period).astype(xp.float32) * xp.float32(179.0 / self.hue_period)
+            self.hue_accum += xp.tensordot(hue, d, axes=1)
+            self.motion_accum += d.sum(axis=0)
+        self.prev = batch[-1].copy()
+        self.frame_index += n
 
     def result(self):
-        hue = np.nan_to_num(self.hue_accum / (self.motion_accum + 1e-6))
-        value = self.motion_accum / (self.motion_accum.max() + 1e-6)
+        xp = xp_of(self.hue_accum)
+        hue = xp.nan_to_num(self.hue_accum / (self.motion_accum + xp.float32(1e-6)))
+        value = self.motion_accum / (float(self.motion_accum.max()) + 1e-6)
         return _hsv_to_rgb_float(hue, value)
 
 
@@ -323,21 +472,22 @@ class TemporalEntropyProcessor(Processor):
     def __init__(self, hist_bins: int = 32, noise_threshold: float = 3.0, use_gpu: Optional[bool] = None):
         self.hist_bins = int(hist_bins)
         self.noise_threshold = normalise_threshold(noise_threshold)
-        self.use_gpu = HAS_CUPY if use_gpu is None else (use_gpu and HAS_CUPY)
-        self.xp = cp if self.use_gpu else np
+        self.gpu = HAS_CUPY if use_gpu is None else bool(use_gpu and HAS_CUPY)
+        self.xp = cp if self.gpu else np
         self.reset()
+
+    def state_bytes(self, frame_shape):
+        # uint16 histogram (uint32 past 65535 frames) + previous frame + temporaries
+        return int(np.prod(frame_shape) * (self.hist_bins * 2 + 3 * 4))
 
     def reset(self):
         self.hist = None  # flat (pixels * bins), uint16 -> upgraded to uint32 if needed
         self.prev = None
         self.shape = None
         self.count = 0
-        if self.use_gpu:
-            cp.get_default_memory_pool().free_all_blocks()
 
     def _add_frame(self, frame):
-        xp = self.xp
-        if self.use_gpu:
+        if self.gpu:
             _entropy_kernel()(frame.ravel(), np.int32(self.hist_bins), self.hist)
         else:
             bins = np.clip(np.floor(frame.ravel() * self.hist_bins), 0, self.hist_bins - 1).astype(np.int64)
@@ -357,7 +507,7 @@ class TemporalEntropyProcessor(Processor):
             if self.prev is not None and self.noise_threshold > 0:
                 # Ignore tiny sensor-noise changes: keep the previous value instead.
                 frame = xp.where(xp.abs(frame - self.prev) < self.noise_threshold, self.prev, frame)
-            self.prev = frame
+            self.prev = frame.copy()
             self._add_frame(xp.ascontiguousarray(frame))
             self.count += 1
 
@@ -365,18 +515,18 @@ class TemporalEntropyProcessor(Processor):
         xp = self.xp
         pixels = int(np.prod(self.shape))
         hist = self.hist.reshape(pixels, self.hist_bins)
-        entropy = np.empty(pixels, np.float32)
+        entropy = xp.empty(pixels, xp.float32)
         chunk = 4_000_000
         for start in range(0, pixels, chunk):
-            p = hist[start:start + chunk].astype(xp.float32) / np.float32(self.count)
-            e = -(p * xp.log2(xp.maximum(p, np.float32(1e-12)))).sum(axis=1)
-            entropy[start:start + chunk] = cp.asnumpy(e) if self.use_gpu else e
-        entropy /= np.log2(self.hist_bins)
-        return np.clip(entropy.reshape(self.shape), 0.0, 1.0)
+            p = hist[start:start + chunk].astype(xp.float32) / xp.float32(self.count)
+            entropy[start:start + chunk] = -(p * xp.log2(xp.maximum(p, xp.float32(1e-12)))).sum(axis=1)
+        entropy /= xp.float32(np.log2(self.hist_bins))
+        return xp.clip(entropy.reshape(self.shape), 0.0, 1.0)
 
 
 class OpticalFlowProcessor(Processor):
     name = "optical_flow_accum"
+    gpu = False
     description = "Accumulated dense optical flow: hue = average direction, brightness = total movement."
 
     def __init__(self, pyr_scale=0.5, levels=8, winsize=4, iterations=5, poly_n=7, poly_sigma=1.2):
@@ -413,18 +563,48 @@ class OpticalFlowProcessor(Processor):
         return _hsv_to_rgb_float(hue, value)
 
 
+def _dilate_cross(mask):
+    """3x3 cross dilation over the last two axes (pixels outside the image count as False)."""
+    out = mask.copy()
+    out[..., 1:, :] |= mask[..., :-1, :]
+    out[..., :-1, :] |= mask[..., 1:, :]
+    out[..., :, 1:] |= mask[..., :, :-1]
+    out[..., :, :-1] |= mask[..., :, 1:]
+    return out
+
+
+def _erode_cross(mask):
+    """3x3 cross erosion over the last two axes (pixels outside the image count as True, like OpenCV)."""
+    out = mask.copy()
+    out[..., 1:, :] &= mask[..., :-1, :]
+    out[..., :-1, :] &= mask[..., 1:, :]
+    out[..., :, 1:] &= mask[..., :, :-1]
+    out[..., :, :-1] &= mask[..., :, 1:]
+    return out
+
+
+def binary_close(mask, iterations: int):
+    """Morphological closing with a 3x3 cross; same result as OpenCV's MORPH_CLOSE,
+    but works on NumPy or CuPy and on a whole (N, H, W) stack at once."""
+    for _ in range(iterations):
+        mask = _dilate_cross(mask)
+    for _ in range(iterations):
+        mask = _erode_cross(mask)
+    return mask
+
+
 class MotionOverlayProcessor(Processor):
     """Pass 1 builds an average background; pass 2 pastes moving objects onto it."""
 
     name = "motion_overlay"
     two_pass = True
     description = "Moving objects pasted onto a clean average background."
+    state_frames = 5.0
 
     def __init__(self, motion_threshold: float = 22, intensity_priority: bool = True, close_iterations: int = 2):
         self.motion_threshold = normalise_threshold(motion_threshold)
         self.intensity_priority = intensity_priority
         self.close_iterations = close_iterations
-        self._kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
         self.reset()
 
     def reset(self):
@@ -435,32 +615,45 @@ class MotionOverlayProcessor(Processor):
         self.max_deviation = None
 
     def update(self, batch):
-        s = batch.sum(axis=0, dtype=np.float64)
+        s = _batch_sum(batch)
         self.total = s if self.total is None else self.total + s
         self.count += batch.shape[0]
 
     def begin_second_pass(self):
-        self.background = (self.total / self.count).astype(np.float32)
+        xp = xp_of(self.total)
+        self.background = (self.total / self.count).astype(xp.float32)
         self.total = None
         self.canvas = self.background.copy()
-        self.max_deviation = np.zeros(self.background.shape[:2], np.float32)
+        self.max_deviation = xp.zeros(self.background.shape[:2], xp.float32)
 
     def update_second_pass(self, batch):
-        for frame in batch:
-            deviation = np.abs(frame - self.background).max(axis=2)
-            mask = (deviation > self.motion_threshold).astype(np.uint8)
-            if self.close_iterations:
-                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel, iterations=self.close_iterations)
-            mask = mask.astype(bool)
-            if self.intensity_priority:
-                mask &= deviation > self.max_deviation
-                self.max_deviation[mask] = deviation[mask]
-            self.canvas[mask] = frame[mask]
+        """Vectorised over the batch. Equivalent to looping frame by frame:
+        with intensity priority a pixel takes the frame with the largest
+        deviation seen so far (earliest wins ties); otherwise the latest moving frame."""
+        xp = xp_of(batch)
+        deviation = _channel_max(xp.abs(batch - self.background))  # (N, H, W)
+        mask = deviation > self.motion_threshold
+        if self.close_iterations:
+            mask = binary_close(mask, self.close_iterations)
+
+        if self.intensity_priority:
+            masked = xp.where(mask, deviation, xp.float32(-1.0))
+            pick = masked.argmax(axis=0)
+            best = xp.take_along_axis(masked, pick[None], axis=0)[0]
+            accept = best > self.max_deviation
+            self.max_deviation = xp.where(accept, best, self.max_deviation)
+        else:
+            pick = batch.shape[0] - 1 - mask[::-1].argmax(axis=0)
+            accept = mask.any(axis=0)
+
+        chosen = xp.take_along_axis(batch, pick[None, :, :, None], axis=0)[0]
+        self.canvas = xp.where(accept[:, :, None], chosen, self.canvas)
 
     def result(self):
+        xp = xp_of(self.canvas if self.canvas is not None else self.total)
         if self.canvas is None:  # second pass never ran
-            return (self.total / self.count).astype(np.float32)
-        return np.clip(self.canvas, 0.0, 1.0)
+            return (self.total / self.count).astype(xp.float32)
+        return xp.clip(self.canvas, 0.0, 1.0)
 
 
 PROCESSORS: Dict[str, Type[Processor]] = {

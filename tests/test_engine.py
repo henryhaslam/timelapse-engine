@@ -36,7 +36,7 @@ class ArraySource(te.FrameSource):
     def __len__(self):
         return len(self.frames)
 
-    def read_many(self, indices):
+    def read_raw(self, indices):
         return [self.frames[i] for i in indices]
 
 
@@ -143,16 +143,216 @@ def test_windows_reuse_frames():
     class CountingSource(ArraySource):
         reads = 0
 
-        def read_many(self, indices):
+        def read_raw(self, indices):
             CountingSource.reads += len(indices)
-            return super().read_many(indices)
+            return super().read_raw(indices)
 
     src = CountingSource(frames)
+    src.probe()
+    CountingSource.reads = 0
     windows = list(te.iter_windows(src, blend=8, step=3))
     assert len(windows) == len(range(0, 20, 3))
     assert CountingSource.reads == 20  # every frame decoded exactly once
     start, w = windows[1]
     np.testing.assert_array_equal(w, frames[3:11])
+
+    # step larger than blend skips frames entirely
+    CountingSource.reads = 0
+    windows = list(te.iter_windows(src, blend=2, step=5))
+    assert CountingSource.reads == 8 and len(windows) == 4
+
+
+def test_windows_gpu_matches_cpu():
+    frames = make_frames(14)
+    outs = {}
+    for device in ("cpu", "gpu") if te.HAS_CUPY else ("cpu",):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            paths = te.render_frames(ArraySource(frames), "average", tmp, "w", blend=4, step=3, ext="tiff",
+                                     device=device)
+            outs[device] = [tifffile.imread(p) for p in paths]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    expected = [files.to_uint16(frames[s:s + 4].mean(axis=0)) for s in range(0, 14, 3)]
+    for device, imgs in outs.items():
+        assert len(imgs) == len(expected)
+        for got, exp in zip(imgs, expected):
+            assert np.abs(got.astype(int) - exp.astype(int)).max() <= 1, device
+
+
+class CaptureSink(te.outputs.Sink):
+    def __init__(self):
+        self.frames = []
+
+    def write(self, frame):
+        self.frames.append(te.backend.asnumpy(frame).copy())
+
+
+def test_running_sums_match_recompute():
+    rng = np.random.default_rng(11)
+    frames16 = rng.integers(0, 65535, (23, 16, 20, 3), dtype=np.uint16)  # raw 16-bit, like TIFFs
+    for name in ("average", "temporal_std"):
+        for blend, step in ((5, 1), (6, 4), (3, 7)):
+            for device in ("cpu", "gpu") if te.HAS_CUPY else ("cpu",):
+                sliding, recompute = CaptureSink(), CaptureSink()
+                te.render_windows(ArraySource(frames16), name, [sliding], blend, step, device=device)
+                proc = te.create_processor(name)
+                proc.sliding = False
+                te.render_windows(ArraySource(frames16), proc, [recompute], blend, step, device=device)
+                assert len(sliding.frames) == len(recompute.frames) == len(range(0, 23, step))
+                for a, b in zip(sliding.frames, recompute.frames):
+                    assert np.abs(a.astype(int) - b.astype(int)).max() <= 1, (name, blend, step, device)
+
+
+# ---------------------------------------------------------------------------
+# GPU parity and vectorised maths
+# ---------------------------------------------------------------------------
+
+def test_gpu_matches_cpu_for_every_processor():
+    if not te.HAS_CUPY:
+        print("  (CuPy not available, skipping)")
+        return
+    frames = make_frames(13, seed=3)
+    for name, cls in te.PROCESSORS.items():
+        if not cls.gpu or name == "temporal_entropy":
+            continue
+        cpu = te.stack(ArraySource(frames), te.create_processor(name), batch_size=5, device="cpu")
+        gpu = te.stack(ArraySource(frames), te.create_processor(name), batch_size=5, device="gpu")
+        np.testing.assert_allclose(gpu, cpu, atol=2e-5, err_msg=name)
+
+
+def test_binary_close_matches_opencv():
+    import cv2
+    from timelapse_engine.processors import binary_close
+
+    rng = np.random.default_rng(5)
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    for density in (0.05, 0.3, 0.7):
+        mask = rng.random((40, 57)) < density
+        expected = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel, iterations=2).astype(bool)
+        np.testing.assert_array_equal(binary_close(mask, 2), expected)
+
+
+def _motion_overlay_reference(frames, threshold, priority):
+    """Original frame-by-frame algorithm, for checking the vectorised version."""
+    import cv2
+
+    bg = frames.mean(axis=0, dtype=np.float64).astype(np.float32)
+    canvas, max_dev = bg.copy(), np.zeros(bg.shape[:2], np.float32)
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    for f in frames:
+        dev = np.abs(f - bg).max(axis=2)
+        mask = cv2.morphologyEx((dev > threshold).astype(np.uint8), cv2.MORPH_CLOSE, kernel, iterations=2).astype(bool)
+        if priority:
+            mask &= dev > max_dev
+            max_dev[mask] = dev[mask]
+        canvas[mask] = f[mask]
+    return canvas
+
+
+def test_motion_overlay_vectorised_matches_loop():
+    frames = make_frames(17, seed=7) * 0.3
+    frames[3, 5:15, 5:15] += 0.5
+    frames[9, 10:30, 20:40] += 0.6
+    frames[14, 8:12, 8:50] += 0.4
+    for priority in (True, False):
+        expected = _motion_overlay_reference(frames, 40 / 255, priority)
+        for device in ("cpu", "gpu") if te.HAS_CUPY else ("cpu",):
+            proc = te.create_processor("motion_overlay", motion_threshold=40, intensity_priority=priority)
+            got = te.stack(ArraySource(frames), proc, batch_size=4, device=device)
+            np.testing.assert_allclose(got, np.clip(expected, 0, 1), atol=1e-6, err_msg=f"{priority} {device}")
+
+
+def _smooth_rgb16(h=96, w=128):
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    img = np.stack([xx / w, yy / h, 0.5 + 0.4 * np.sin(xx / 9) * np.cos(yy / 7)], axis=-1)
+    return (np.clip(img, 0, 1) * 65535).astype(np.uint16)
+
+
+def test_yuv_packing_matches_ffmpeg_bt709():
+    import subprocess
+
+    from timelapse_engine import colour
+
+    if shutil.which("ffmpeg") is None:
+        print("  (ffmpeg not on PATH, skipping)")
+        return
+    # Exact BT.709 limited-range levels for greys (FFmpeg's own rgb48 path is ~0.3% off: white = 943)
+    greys = np.array([0, 16384, 32768, 49152, 65535], np.uint16)
+    grey_img = np.repeat(np.repeat(greys, 2)[None, :, None], 2, axis=0).repeat(3, axis=2)
+    y = colour.pack(grey_img, "yuv422p10le")[0][: grey_img.shape[1]: 2]
+    np.testing.assert_array_equal(y, [64, 283, 502, 721, 940])
+
+    img = _smooth_rgb16()
+    h, w = img.shape[:2]
+    # FFmpeg as an independent reference, with tolerance for its rounding error
+    for pix_fmt, tol in (("yuv422p10le", 4), ("yuv420p10le", 4), ("p010le", 4 << 6), ("yuv420p", 2)):
+        ref = subprocess.run(
+            ["ffmpeg", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb48le", "-s", f"{w}x{h}", "-i", "-",
+             "-vf", f"scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int,format={pix_fmt}",
+             "-f", "rawvideo", "-"], input=img.tobytes(), capture_output=True, check=True).stdout
+        dtype = np.uint8 if pix_fmt == "yuv420p" else np.uint16
+        ref = np.frombuffer(ref, dtype)
+        for device in ("cpu", "gpu") if te.HAS_CUPY else ("cpu",):
+            frame = img if device == "cpu" else te.backend.cp.asarray(img)
+            got, size = colour.pack(frame, pix_fmt)
+            got = te.backend.asnumpy(got)
+            assert size == (h, w) and got.shape == ref.shape and got.dtype == ref.dtype, pix_fmt
+            luma = h * w
+            assert np.abs(got[:luma].astype(int) - ref[:luma].astype(int)).max() <= tol, (pix_fmt, device, "Y")
+            assert np.abs(got[luma:].astype(int) - ref[luma:].astype(int)).max() <= tol, (pix_fmt, device, "C")
+
+
+def test_area_resize_matches_opencv():
+    import cv2
+
+    from timelapse_engine import colour
+
+    img = _smooth_rgb16(97, 130).astype(np.float32) / 65535
+    for h, w in ((27, 36), (54, 72), (97, 130)):
+        expected = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+        np.testing.assert_allclose(colour.resize_area(img, h, w), expected, atol=2e-3)
+    assert colour.output_size(3888, 5184, (1080, None)) == (1080, 1440)
+    assert colour.output_size(3888, 5184, (None, 3840)) == (2880, 3840)
+    assert colour.output_size(1080, 1920, (2160, None)) == (1080, 1920)  # never upscales
+
+
+def test_memory_plan():
+    from timelapse_engine.engine import MemoryPlan
+
+    shape = (3888, 5184, 3)
+    assert MemoryPlan(te.create_processor("average"), shape, np.uint8, False, 100).batch == 16
+    assert MemoryPlan(te.create_processor("average"), shape, np.uint16, False, 100).batch == 8
+    try:
+        MemoryPlan(te.create_processor("median"), shape, np.uint16, False, 100_000)
+    except MemoryError as exc:
+        assert "Process fewer frames" in str(exc)
+    else:
+        raise AssertionError("expected MemoryError")
+    if te.HAS_CUPY:
+        small = MemoryPlan(te.create_processor("average"), shape, np.uint16, True, 100, window=4)
+        huge = MemoryPlan(te.create_processor("average"), shape, np.uint16, True, 100, window=500)
+        assert small.cache_on_gpu and not huge.cache_on_gpu and huge.chunk >= 1
+
+
+def test_opencv_decode_matches_pillow():
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        rng = np.random.default_rng(2)
+        img = (rng.random((H, W, 3)) * 255).astype(np.uint8)
+        Image.fromarray(img).save(tmp / "a.jpg", quality=95)
+        tifffile.imwrite(tmp / "b.tif", (rng.random((H, W, 3)) * 65535).astype(np.uint16), photometric="rgb")
+        with Image.open(tmp / "a.jpg") as im:
+            pil = np.asarray(im)
+        cv = te.load_raw(tmp / "a.jpg")
+        assert cv.dtype == np.uint8 and cv.shape == (H, W, 3)
+        assert np.abs(cv.astype(int) - pil.astype(int)).max() <= 2
+        np.testing.assert_array_equal(te.load_raw(tmp / "b.tif"), tifffile.imread(tmp / "b.tif"))
+        slot = np.empty((H, W, 3), np.uint16)
+        files.decode_into(tmp / "b.tif", slot)
+        np.testing.assert_array_equal(slot, tifffile.imread(tmp / "b.tif"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

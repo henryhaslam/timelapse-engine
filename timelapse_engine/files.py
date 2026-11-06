@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
+import cv2
 import numpy as np
 import tifffile
 from PIL import Image
@@ -179,17 +180,101 @@ def validate_sequence(paths: Sequence[str], workers: int = 8) -> None:
 # Loading
 # ---------------------------------------------------------------------------
 
+def as_hwc(img: np.ndarray) -> np.ndarray:
+    """Ensure (H, W, C) layout and drop any alpha channel."""
+    if img.ndim == 2:
+        return img[:, :, None]
+    if img.shape[2] == 4:
+        return img[:, :, :3]
+    return img
+
+
 def to_float(img: np.ndarray) -> np.ndarray:
     """Convert any integer or float image to float32 in 0-1 with shape (H, W, C)."""
+    img = as_hwc(img)
     if np.issubdtype(img.dtype, np.integer):
-        out = img.astype(np.float32) / np.float32(np.iinfo(img.dtype).max)
-    else:
-        out = img.astype(np.float32, copy=False)
-    if out.ndim == 2:
-        out = out[:, :, None]
-    elif out.ndim == 3 and out.shape[2] == 4:
-        out = out[:, :, :3]  # drop alpha
-    return out
+        return img.astype(np.float32) / np.float32(np.iinfo(img.dtype).max)
+    return img.astype(np.float32, copy=False)
+
+
+# OpenCV decodes ~2.5x faster than Pillow here and releases the GIL, so it
+# scales across threads. EXIF orientation is ignored (same as before).
+_CV2_JPEG_FLAGS = cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION
+_CV2_TIFF_FLAGS = cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR | cv2.IMREAD_IGNORE_ORIENTATION
+
+
+def _cv2_decode(path: str) -> Optional[np.ndarray]:
+    """Decode with OpenCV (BGR / gray), or None if OpenCV can't read it.
+    Reads bytes with NumPy so non-ASCII Windows paths work."""
+    flags = _CV2_TIFF_FLAGS if path.lower().endswith(TIFF_EXTENSIONS) else _CV2_JPEG_FLAGS
+    try:
+        return cv2.imdecode(np.fromfile(path, dtype=np.uint8), flags)
+    except cv2.error:
+        return None
+
+
+def _fallback_decode(path: str) -> np.ndarray:
+    """Slower decoders for files OpenCV can't handle. Returns RGB (H, W, C)."""
+    if path.lower().endswith(TIFF_EXTENSIONS):
+        img = tifffile.imread(path)
+        if img.ndim == 3 and img.shape[0] in (3, 4) and img.shape[-1] not in (3, 4):
+            img = np.moveaxis(img, 0, -1)  # separate colour planes -> interleaved
+        return as_hwc(img)
+    with Image.open(path) as im:
+        return as_hwc(np.asarray(im.convert("RGB") if im.mode not in ("RGB", "L") else im))
+
+
+_BGR_TO_RGB = {3: cv2.COLOR_BGR2RGB, 4: cv2.COLOR_BGRA2RGB}
+
+
+def _tiff_into(path: str, out: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+    """Read a TIFF with tifffile, straight into ``out`` when given. For uncompressed
+    TIFFs this is a plain file read (~6x faster than OpenCV). Returns None if the
+    file's layout doesn't fit ``out`` or tifffile can't decode it."""
+    try:
+        with tifffile.TiffFile(path) as tif:
+            page = tif.pages[0]
+            if out is None:
+                img = page.asarray()
+                if img.ndim == 3 and img.shape[0] in (3, 4) and img.shape[-1] not in (3, 4):
+                    img = np.moveaxis(img, 0, -1)  # separate colour planes -> interleaved
+                return as_hwc(img)
+            if page.shape == out.shape and page.dtype == out.dtype:
+                page.asarray(out=out)
+                return out
+            if page.ndim == 2 and out.shape[2] == 1 and page.dtype == out.dtype:
+                page.asarray(out=out[:, :, 0])
+                return out
+    except Exception:
+        pass
+    return None
+
+
+def load_raw(path) -> np.ndarray:
+    """Load a JPEG or TIFF in its native dtype (uint8 / uint16), RGB, (H, W, C)."""
+    path = str(path)
+    if path.lower().endswith(TIFF_EXTENSIONS):
+        img = _tiff_into(path)
+        if img is not None:
+            return img
+    img = _cv2_decode(path)
+    if img is None:
+        return _fallback_decode(path)
+    if img.ndim == 2:
+        return img[:, :, None]
+    return cv2.cvtColor(img, _BGR_TO_RGB[img.shape[2]])
+
+
+def decode_into(path, out: np.ndarray) -> None:
+    """Decode ``path`` straight into ``out`` (a preallocated (H, W, C) slot of the right dtype)."""
+    path = str(path)
+    if path.lower().endswith(TIFF_EXTENSIONS) and _tiff_into(path, out) is not None:
+        return
+    img = _cv2_decode(path)
+    if img is not None and img.ndim == 3 and out.shape[2] == 3 and img.dtype == out.dtype:
+        cv2.cvtColor(img, _BGR_TO_RGB[img.shape[2]], dst=out)  # channel swap + copy in one pass
+        return
+    out[...] = as_hwc(img) if img is not None and img.ndim == 2 else load_raw(path)
 
 
 def load_image(path) -> np.ndarray:
@@ -198,15 +283,7 @@ def load_image(path) -> np.ndarray:
     Scaling is based on the file's real dtype, so 8-bit TIFFs are scaled by
     255 and 16-bit TIFFs by 65535.
     """
-    path = str(path)
-    if path.lower().endswith(TIFF_EXTENSIONS):
-        img = tifffile.imread(path)
-        if img.ndim == 3 and img.shape[0] in (3, 4) and img.shape[-1] not in (3, 4):
-            img = np.moveaxis(img, 0, -1)  # separate colour planes -> interleaved
-    else:
-        with Image.open(path) as im:
-            img = np.asarray(im.convert("RGB") if im.mode not in ("RGB", "L") else im)
-    return to_float(img)
+    return to_float(load_raw(path))
 
 
 def read_xmp(path) -> Optional[bytes]:
@@ -231,10 +308,20 @@ def read_xmp(path) -> Optional[bytes]:
 # ---------------------------------------------------------------------------
 
 def to_uint8(img: np.ndarray) -> np.ndarray:
+    """float 0-1 or uint16 -> uint8 (rounded)."""
+    if img.dtype == np.uint8:
+        return img
+    if img.dtype == np.uint16:
+        return ((img.astype(np.uint32) * 255 + 32767) // 65535).astype(np.uint8)
     return (np.clip(img, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
 
 
 def to_uint16(img: np.ndarray) -> np.ndarray:
+    """float 0-1 or uint8 -> uint16."""
+    if img.dtype == np.uint16:
+        return img
+    if img.dtype == np.uint8:
+        return img.astype(np.uint16) * np.uint16(257)
     return (np.clip(img, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
 
 
@@ -265,7 +352,7 @@ def resolve_output_path(path, overwrite: str = "increment") -> Path:
 
 def save_image(path, img: np.ndarray, xmp: Optional[bytes] = None,
                timestamp: Optional[datetime] = None, jpeg_quality: int = 100) -> Path:
-    """Save a float 0-1 image. TIFF -> 16-bit (with optional XMP), JPEG -> 8-bit (with EXIF dates).
+    """Save a float 0-1 (or uint16) image. TIFF -> 16-bit (with optional XMP), JPEG -> 8-bit (with EXIF dates).
 
     ``timestamp`` is written into JPEG EXIF and used as the file's modified time
     for both formats.

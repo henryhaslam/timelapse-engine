@@ -1,7 +1,8 @@
 """Frame sources: a uniform way to read frames from an image folder or a video file.
 
-Every source returns float32 0-1 frames with shape (H, W, C), so processors
-never need to know where the pixels came from.
+Sources hand out frames in their *native* dtype (uint8 / uint16) as RGB
+(H, W, C). The engine keeps them as integers until they are on the GPU (4x
+less data to move than float32) and converts to float 0-1 there.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -20,19 +21,37 @@ from .progress import logger
 
 
 class FrameSource(ABC):
-    """Base class. Subclasses implement ``__len__`` and ``read_many``."""
+    """Base class. Subclasses implement ``__len__`` and ``read_raw``; overriding
+    ``read_into`` lets a source decode straight into the engine's buffers."""
 
     name: str = "source"
+    _probe: Optional[Tuple[tuple, np.dtype]] = None
 
     @abstractmethod
     def __len__(self) -> int: ...
 
     @abstractmethod
+    def read_raw(self, indices: Sequence[int]) -> List[np.ndarray]:
+        """Frames in native dtype, RGB, (H, W, C)."""
+
+    def read_into(self, indices: Sequence[int], out: np.ndarray) -> None:
+        """Fill ``out[k]`` with frame ``indices[k]``."""
+        for k, frame in enumerate(self.read_raw(indices)):
+            out[k] = files.as_hwc(frame)
+
     def read_many(self, indices: Sequence[int]) -> List[np.ndarray]:
-        """Read several frames (float32 0-1, H x W x C)."""
+        """Frames as float32 0-1 (convenience; the engine uses the raw methods)."""
+        return [files.to_float(f) for f in self.read_raw(indices)]
 
     def read(self, index: int) -> np.ndarray:
         return self.read_many([index])[0]
+
+    def probe(self) -> Tuple[tuple, np.dtype]:
+        """(frame shape (H, W, C), dtype) taken from the first frame."""
+        if self._probe is None:
+            first = files.as_hwc(self.read_raw([0])[0])
+            self._probe = (first.shape, first.dtype)
+        return self._probe
 
     def capture_time(self, index: int) -> Optional[datetime]:
         return None
@@ -70,7 +89,7 @@ class ImageSequence(FrameSource):
     """
 
     def __init__(self, folder=None, paths: Optional[Sequence[str]] = None, sort: str = "exif",
-                 validate: bool = True, workers: int = 8, exiftool_path: Optional[str] = None):
+                 validate: bool = True, workers: int = 16, exiftool_path: Optional[str] = None):
         if (folder is None) == (paths is None):
             raise ValueError("Pass exactly one of 'folder' or 'paths'.")
         if paths is None:
@@ -105,10 +124,19 @@ class ImageSequence(FrameSource):
     def __len__(self) -> int:
         return len(self.paths)
 
-    def read_many(self, indices: Sequence[int]) -> List[np.ndarray]:
+    @property
+    def pool(self) -> ThreadPoolExecutor:
         if self._pool is None:
-            self._pool = ThreadPoolExecutor(max_workers=self.workers)
-        return list(self._pool.map(files.load_image, [self.paths[i] for i in indices]))
+            self._pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="decode")
+        return self._pool
+
+    def read_raw(self, indices: Sequence[int]) -> List[np.ndarray]:
+        return list(self.pool.map(files.load_raw, [self.paths[i] for i in indices]))
+
+    def read_into(self, indices: Sequence[int], out: np.ndarray) -> None:
+        jobs = [self.pool.submit(files.decode_into, self.paths[i], out[k]) for k, i in enumerate(indices)]
+        for job in jobs:
+            job.result()
 
     def _ensure_times(self):
         if self._times is None:
@@ -156,9 +184,9 @@ class VideoSource(FrameSource):
     def fps(self) -> Optional[float]:
         return self._meta.get("fps")
 
-    def read_many(self, indices: Sequence[int]) -> List[np.ndarray]:
+    def read_raw(self, indices: Sequence[int]) -> List[np.ndarray]:
         with self._lock:
-            return [files.to_float(self._reader.get_data(i)) for i in indices]
+            return [files.as_hwc(np.asarray(self._reader.get_data(i))) for i in indices]
 
     def close(self) -> None:
         self._reader.close()

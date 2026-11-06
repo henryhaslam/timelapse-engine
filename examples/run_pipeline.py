@@ -36,6 +36,7 @@ RUN_BLENDED_VIDEO = True
 
 BLEND_PROCESS = "average"
 BLEND, STEP, FPS = 8, 3, 24
+MASTER = "prores"              # "prores" (CPU, ~8 fps at 20 MP) or "hevc_nvenc" (GPU, much faster)
 
 # %%
 # ---------------------------------------------------------------------------
@@ -46,17 +47,17 @@ for source_path, export_dir, name in JOBS:
 
         if RUN_STILL_STACKS:
             for process in STILL_PROCESSES:
+                # batch / GPU chunk sizes are picked automatically from frame size and free memory
                 te.stack_to_file(source, process, export_dir, name, ext=STILL_FORMAT,
-                                 batch_size=3 if process == "temporal_entropy" else 16,
                                  progress=progress, **PROCESS_PARAMS.get(process, {}))
 
         if RUN_CLEAN_VIDEO:
             te.render_video(source, "average", export_dir, f"{name}_RAW", blend=1, step=1, fps=FPS,
-                            master="prores", preview_1080p=False, progress=progress)
+                            master=MASTER, preview_1080p=False, progress=progress)
 
         if RUN_BLENDED_VIDEO:
             te.render_video(source, BLEND_PROCESS, export_dir, f"{name}_{BLEND_PROCESS}_{BLEND}_s{STEP}",
-                            blend=BLEND, step=STEP, fps=FPS, master="prores", preview_1080p=False,
+                            blend=BLEND, step=STEP, fps=FPS, master=MASTER, preview_1080p=False,
                             progress=progress, **PROCESS_PARAMS.get(BLEND_PROCESS, {}))
 
 # %% [markdown]

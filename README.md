@@ -30,6 +30,9 @@ te.stack_to_file(r"E:\TL\shoot", "maximum", r"E:\TL\out", ext="tiff", progress=p
 # Rolling window -> video (ProRes master + 1080p preview)
 te.render_video(r"E:\TL\shoot", "average", r"E:\TL\out", blend=8, step=3, fps=24, progress=progress)
 
+# Same, with the much faster GPU HEVC master
+te.render_video(r"E:\TL\shoot", "average", r"E:\TL\out", blend=8, step=3, master="hevc_nvenc", progress=progress)
+
 # Video file in, still out
 te.stack_to_file(r"E:\clip.mp4", "motion_overlay", r"E:\out", motion_threshold=20, progress=progress)
 ```
@@ -40,10 +43,12 @@ See [`examples/run_pipeline.py`](examples/run_pipeline.py) for the full batch wo
 
 | Module | Purpose |
 |---|---|
-| `sources.py` | `ImageSequence` (folder, EXIF-sorted, validated) and `VideoSource`; both yield float32 0–1 frames |
-| `processors.py` | All stacking effects behind one `reset / update / result` interface |
-| `engine.py` | `stack`, `stack_to_file`, `render_windows`, `render_video`, `render_frames`, `sweep_parameter` |
-| `outputs.py` | Numbered-still sink and a single-process multi-output FFmpeg sink |
+| `sources.py` | `ImageSequence` (folder, EXIF-sorted, validated) and `VideoSource`; frames come out in their native 8/16-bit form |
+| `processors.py` | All stacking effects behind one `reset / update / result` interface; the same code runs on NumPy or CuPy |
+| `engine.py` | `stack`, `stack_to_file`, `render_windows`, `render_video`, `render_frames`, `sweep_parameter`, memory planning |
+| `outputs.py` | Numbered-still sink and FFmpeg video sink (one encoder process per output) |
+| `colour.py` | BT.709 RGB → Y'CbCr packing and area downscaling for video, on the GPU |
+| `backend.py` | CPU/GPU helpers |
 | `files.py` | Loading, sorting, validation, XMP/EXIF, saving |
 | `progress.py` | Progress callback, `CancelToken`, console progress bar |
 | `stabilise.py` | Point picking, LK tracking, translation stabilisation |
@@ -59,6 +64,60 @@ descriptions.
 
 The same processor code is used for still stacks and video windows, so a blended video frame matches the still you
 would get from the same frames.
+
+## Performance
+
+How a frame moves through the engine (GPU path):
+
+1. **Decode:** 16 threads decode JPEGs with OpenCV straight into reusable pinned buffers. Uncompressed TIFFs are
+   read straight into the buffer with tifffile. Three buffers are kept: two being decoded while one is processed.
+2. **Upload:** frames stay 8/16-bit until they are on the GPU, so far less data crosses PCIe than float32 would.
+3. **Process:** frames are converted to float in chunks sized to free VRAM. All processors except median, mode and
+   optical flow run on the GPU.
+4. **Rolling windows:** each frame is decoded and uploaded once. `average` and `temporal_std` use exact integer
+   running sums, so cost per output frame doesn't grow with `blend`.
+5. **Video output:** BT.709 Y'CbCr conversion and preview downscaling happen on the GPU. Each output gets its own
+   FFmpeg process and writer thread, and data goes through the pipe in 4 MB pieces (single 100 MB writes are ~5×
+   slower on Windows).
+
+Batch size, GPU chunk size and where the window cache lives (VRAM or RAM) are picked per job from frame size and
+free memory (`engine.MemoryPlan`). Median and mode, which must hold every frame in RAM, fail at the start with a
+clear message if they can't fit.
+
+Measured on a Ryzen 7 7700X, RTX 3080 Ti 12 GB and 64 GB RAM, with 96 frames at 5184×3888 and files already in
+the OS cache. Numbers are frames per second.
+
+**Stills**
+
+| | JPEG, v0.1 (CPU) | JPEG, now | 16-bit TIFF, now |
+|---|---|---|---|
+| average | 7.3 | 34–38 | 72 |
+| maximum | ~10 | 33 | 82 |
+| temporal_entropy | – | 30 | 44 |
+| motion_overlay (2 passes) | 1.1 | 17 | 37 |
+
+**Video** (output frames per second)
+
+| | JPEG | 16-bit TIFF |
+|---|---|---|
+| blend 1 → ProRes HQ | 2.2 (encoder limit 2.7 on this footage) | 7.2 (encoder limit 7.6) |
+| blend 1 → `hevc_nvenc` | 17 | 19 |
+| blend 8 / step 3 → 1080p preview | 10 | 15 |
+| blend 30 / step 1 average → `hevc_nvenc` | 9.5 | 21 (was 2.8) |
+| blend 60 / step 1 average → `hevc_nvenc` | 6.6 | 13 (was 1.1) |
+
+Peak use on the TIFF runs is about 3.5–4.5 GB of RAM (it was 12 GB before memory planning) and up to 8.7 GB of
+VRAM.
+
+What limits speed:
+
+- **Disk, on a first (cold) read.** A SATA SSD reads ~14 of these 30 MB JPEGs per second, so put big jobs on NVMe.
+- **JPEG decode:** ~40 fps on 16 threads.
+- **ProRes encoding,** which runs on the CPU and slows down a lot on detailed or noisy footage (2.7–7.6 fps at
+  20 MP here). `master="hevc_nvenc"` (10-bit HEVC on the GPU) is 3–7× faster. A ProRes master at 4K resolution
+  would also help.
+
+`benchmarks/bench.py` and `benchmarks/memory_bench.py` reproduce these numbers.
 
 ## Changes from `image_functions_2.py`
 
@@ -96,11 +155,11 @@ Clean-up:
 - `process_frames`, `process_video_to_video` and `render_timelapse_pipeline` are merged into `render_windows`
   with pluggable outputs. Overlapping windows reuse decoded frames instead of re-reading them (about 2.7× fewer
   decodes at blend 8 / step 3).
-- The next batch now loads in the background while the current one is processed.
-- FFmpeg writes every output (master + previews) from one process with a `split` filter, so each frame goes
-  through the pipe once. Odd dimensions are cropped to even. The `hevc_lossless` master now uses real
-  `lossless=1`, since `-crf 0` is not lossless in x265.
-- Motion overlay closing uses OpenCV morphology (much faster than `scipy.ndimage`).
+- Odd frame dimensions are cropped to even for video. The `hevc_lossless` master now uses real `lossless=1`,
+  since `-crf 0` is not lossless in x265.
+- Video is now converted to Y'CbCr with the **BT.709** matrix and tagged as such. FFmpeg's default for untagged
+  RGB input (what the old pipeline used) is BT.601, so players and Resolve, which assume BT.709 for HD and
+  larger video, showed slightly shifted colours.
 
 ## Tests
 
