@@ -18,11 +18,11 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import QByteArray, QSettings, QSize, Qt, QThread, QTimer
-from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette
+from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
                                QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
-                               QSlider, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
+                               QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
                                QVBoxLayout, QWidget)
 
 from .. import __version__, backend
@@ -30,7 +30,7 @@ from ..jobs import (KINDS, MASTERS, Job, SourceCache, default_export, is_video, 
                     save_queue)
 from ..processors import PROCESSORS
 from ..progress import CancelToken, logger
-from .widgets import ImageView, ParamForm, PathPicker
+from .widgets import ImageView, ParamForm, PathPicker, Timeline
 from .worker import QtLogHandler, QueueRunner, TaskRunner
 
 DISPLAY_NAMES = {
@@ -168,18 +168,6 @@ class MainWindow(QMainWindow):
         self.source_info.setWordWrap(True)
         self.source_info.setStyleSheet("color: palette(mid);")
         src_form.addRow(self.source_info)
-        range_row = QHBoxLayout()
-        self.first_spin = QSpinBox(minimum=1, maximum=1)
-        self.last_spin = QSpinBox(minimum=1, maximum=1)
-        all_btn = QPushButton("All")
-        all_btn.setFixedWidth(44)
-        all_btn.clicked.connect(self._reset_range)
-        for w in (QLabel("Frames"), self.first_spin, QLabel("to"), self.last_spin, all_btn):
-            range_row.addWidget(w)
-        range_row.addStretch(1)
-        self.first_spin.valueChanged.connect(self._on_settings_changed)
-        self.last_spin.valueChanged.connect(self._on_settings_changed)
-        src_form.addRow(range_row)
         lay.addWidget(src_box)
 
         # Effect
@@ -306,17 +294,51 @@ class MainWindow(QMainWindow):
         vlay.addLayout(top)
         self.view = ImageView()
         vlay.addWidget(self.view, 1)
+        # Timeline: playhead (current frame) + start/end handles (frames to process)
         scrub = QHBoxLayout()
-        self.slider = QSlider(Qt.Horizontal, minimum=0, maximum=0)
-        self.slider.valueChanged.connect(self._on_frame_changed)
+        self.timeline = self.slider = Timeline()
+        self.timeline.valueChanged.connect(self._on_frame_changed)
+        self.timeline.rangeChanged.connect(self._on_timeline_range)
         self.frame_spin = QSpinBox(minimum=1, maximum=1)
-        self.frame_spin.valueChanged.connect(lambda v: self.slider.setValue(v - 1))
+        self.frame_spin.setToolTip("Current frame")
+        self.frame_spin.valueChanged.connect(lambda v: self.timeline.setValue(v - 1))
         self.frame_label = QLabel()
-        self.frame_label.setMinimumWidth(200)
-        scrub.addWidget(self.slider, 1)
+        self.frame_label.setMinimumWidth(240)
+        scrub.addWidget(self.timeline, 1)
+        scrub.addWidget(QLabel("Frame"))
         scrub.addWidget(self.frame_spin)
         scrub.addWidget(self.frame_label)
         vlay.addLayout(scrub)
+
+        trim = QHBoxLayout()
+        self.first_spin = QSpinBox(minimum=1, maximum=1)
+        self.first_spin.setToolTip("First frame to process (type a number or drag the left blue handle)")
+        self.last_spin = QSpinBox(minimum=1, maximum=1)
+        self.last_spin.setToolTip("Last frame to process (type a number or drag the right blue handle)")
+        for spin in (self.first_spin, self.last_spin, self.frame_spin):
+            spin.setMinimumWidth(72)  # room for 5-digit frame numbers
+        self.first_spin.valueChanged.connect(self._on_first_spin)
+        self.last_spin.valueChanged.connect(self._on_last_spin)
+        set_start = QPushButton("Set start here  (I)")
+        set_start.setToolTip("Start processing at the current frame")
+        set_start.clicked.connect(self.set_start_here)
+        set_end = QPushButton("Set end here  (O)")
+        set_end.setToolTip("Stop processing at the current frame")
+        set_end.clicked.connect(self.set_end_here)
+        use_all = QPushButton("Use all frames")
+        use_all.clicked.connect(self._reset_range)
+        self.range_label = QLabel()
+        self.range_label.setStyleSheet("color: palette(mid);")
+        for w in (QLabel("Start"), self.first_spin, set_start):
+            trim.addWidget(w)
+        trim.addStretch(1)
+        trim.addWidget(self.range_label)
+        trim.addStretch(1)
+        for w in (set_end, QLabel("End"), self.last_spin, use_all):
+            trim.addWidget(w)
+        vlay.addLayout(trim)
+        for key, slot in (("I", self.set_start_here), ("O", self.set_end_here)):
+            QShortcut(QKeySequence(key), self, activated=slot)
         right.addWidget(viewer)
 
         tabs = QTabWidget()
@@ -481,9 +503,9 @@ class MainWindow(QMainWindow):
             spin.blockSignals(True)
             spin.setRange(1, n)
             spin.blockSignals(False)
-        self._apply_range()
         self.frame_spin.setRange(1, n)
-        self.slider.setMaximum(n - 1)
+        self.timeline.setMaximum(n - 1)
+        self._apply_range()
         if info["kind"] == "video" and info["fps"]:
             self.fps_spin.setValue(int(round(info["fps"])))
         out_dir, _ = default_export(info["path"])
@@ -502,17 +524,63 @@ class MainWindow(QMainWindow):
         self.view.set_message(f"Could not load this source.\n\n{message}")
         logger.error("Could not load source: %s", message)
 
+    # ------------------------------------------------------- frame selection
+    # The selection lives in three places that must agree: the timeline's blue
+    # handles and the Start/End boxes (both 1-based on screen, 0-based here).
+    def _set_range(self, lo: int, hi: int) -> None:
+        top = self.timeline.maximum()
+        lo, hi = min(max(lo, 0), top), min(max(hi, 0), top)
+        hi = max(hi, lo)
+        self.timeline.blockSignals(True)
+        self.timeline.setSelection(lo, hi)
+        self.timeline.blockSignals(False)
+        for spin, value in ((self.first_spin, lo + 1), (self.last_spin, hi + 1)):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+        n = top + 1
+        count = hi - lo + 1
+        self.range_label.setText(f"Processing all {n} frames" if count == n else
+                                 f"Processing frames {lo + 1}–{hi + 1}  ·  {count} of {n}")
+        self._update_frame_label()
+        self._on_settings_changed()
+
+    def _on_timeline_range(self, lo: int, hi: int):
+        self._set_range(lo, hi)
+
+    def _on_first_spin(self, value: int):
+        lo = value - 1
+        self._set_range(lo, max(self.last_spin.value() - 1, lo))  # pushing start past end moves the end too
+
+    def _on_last_spin(self, value: int):
+        hi = value - 1
+        self._set_range(min(self.first_spin.value() - 1, hi), hi)
+
+    def set_start_here(self):
+        if not self._source_info:
+            return
+        here = self.timeline.value()
+        lo, hi = self.timeline.selection()
+        self._set_range(here, hi if here <= hi else self.timeline.maximum())
+        self.statusBar().showMessage(f"Start set to frame {here + 1}", 3000)
+
+    def set_end_here(self):
+        if not self._source_info:
+            return
+        here = self.timeline.value()
+        lo, hi = self.timeline.selection()
+        self._set_range(lo if lo <= here else 0, here)
+        self.statusBar().showMessage(f"End set to frame {here + 1}", 3000)
+
     def _apply_range(self):
-        n = self._source_info["frames"] if self._source_info else 1
+        """Apply a range from a loaded job (or select everything)."""
         first, end = getattr(self, "_pending_range", (0, None))
         self._pending_range = (0, None)
-        self.first_spin.setValue(min(first + 1, n))
-        self.last_spin.setValue(n if end is None else min(end, n))
+        self._set_range(first, self.timeline.maximum() if end is None else end - 1)
 
     def _reset_range(self):
         if self._source_info:
-            self.first_spin.setValue(1)
-            self.last_spin.setValue(self._source_info["frames"])
+            self._set_range(0, self.timeline.maximum())
 
     # ------------------------------------------------------------- frame viewer
     def _on_frame_changed(self, value: int):
@@ -543,18 +611,28 @@ class MainWindow(QMainWindow):
                 frame = cv2.resize(frame, (round(w * s), round(h * s)), interpolation=cv2.INTER_AREA)
             name = Path(src.paths[idx]).name if hasattr(src, "paths") else f"frame {idx + 1}"
             when = src.capture_time(idx)
-            return req, frame, name, when
+            return req, idx, frame, name, when
 
         self.tasks.submit(load, on_done=self._on_frame_loaded,
                           on_failed=lambda m: self.view.set_message(f"Could not read frame: {m}"))
 
     def _on_frame_loaded(self, result):
-        req, frame, name, when = result
+        req, idx, frame, name, when = result
         if req != self._frame_request or self.result_btn.isChecked():
             return
         self.view.set_image(frame)
-        self.frame_label.setText(f"{name}" + (f"  ·  {when:%Y-%m-%d %H:%M:%S}" if when else ""))
+        self._frame_meta = (idx, name, when)
+        self._update_frame_label()
         self.view_status.setText("Source frame (double-click to fit, wheel to zoom)")
+
+    def _update_frame_label(self):
+        meta = getattr(self, "_frame_meta", None)
+        if not meta:
+            return
+        idx, name, when = meta
+        lo, hi = self.timeline.selection()
+        outside = "  ·  not processed" if not lo <= idx <= hi else ""
+        self.frame_label.setText(f"{name}" + (f"  ·  {when:%Y-%m-%d %H:%M:%S}" if when else "") + outside)
 
     def _on_view_mode(self, mode: int):
         if mode == 0:

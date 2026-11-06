@@ -18,7 +18,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 try:
-    from PySide6.QtCore import QSettings
+    from PySide6.QtCore import QPoint, QSettings, Qt
+    from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
 except ImportError:  # pragma: no cover
     QApplication = None
@@ -81,6 +82,38 @@ def test_gui_end_to_end(screenshot: str = None):
         # Scrub to a frame
         win.slider.setValue(10)
         wait_until(app, lambda: "IMG_0010" in win.frame_label.text(), what="frame 11")
+
+        # Frame selection: set start/end at the playhead, type numbers, drag a handle
+        assert win.timeline.selection() == (0, 23) and "all 24" in win.range_label.text()
+        win.timeline.setValue(4)
+        win.set_start_here()
+        win.timeline.setValue(17)
+        win.set_end_here()
+        assert (win.first_spin.value(), win.last_spin.value()) == (5, 18)
+        assert win.timeline.selection() == (4, 17)
+        job = win.current_job()
+        assert (job.first_frame, job.end_frame) == (4, 18)
+        assert "5–18" in win.range_label.text() and "14 of 24" in win.range_label.text()
+        assert "14 frames" in win.output_count.text()
+        win.timeline.setValue(2)
+        wait_until(app, lambda: "not processed" in win.frame_label.text(), what="outside-selection note")
+        win.last_spin.setValue(3)              # end before start pulls the start back with it
+        assert win.timeline.selection() == (2, 2)
+        win.first_spin.setValue(10)            # start after end pushes the end forward
+        assert win.timeline.selection() == (9, 9)
+        win.timeline.setValue(1)
+        win.set_end_here()                     # end before start resets the start to the first frame
+        assert win.timeline.selection() == (0, 1)
+        win._reset_range()
+        tl = win.timeline
+        y = int(tl._track().center().y())
+        QTest.mousePress(tl, Qt.LeftButton, Qt.NoModifier, QPoint(int(tl._x(0)), y))
+        QTest.mouseMove(tl, QPoint(int(tl._x(6)), y))
+        QTest.mouseRelease(tl, Qt.LeftButton, Qt.NoModifier, QPoint(int(tl._x(6)), y))
+        assert tl.selection() == (6, 23) and win.first_spin.value() == 7
+        QTest.mouseClick(tl, Qt.LeftButton, Qt.NoModifier, QPoint(int(tl._x(12)), 4))  # top strip scrubs
+        assert tl.value() == 12 and tl.selection() == (6, 23)
+        win._reset_range()
 
         # Preview a still stack
         win.kind_combo.setCurrentIndex(win.kind_combo.findData("still"))
