@@ -155,6 +155,29 @@ def test_gui_end_to_end(screenshot: str = None):
         win._on_queue_double_click(0, 0)
         assert win.kind_combo.currentData() == "still" and win.process_combo.currentData() == "maximum"
 
+        # New effects: grouped list, choice settings, deflicker, smooth motion
+        combo = win.process_combo
+        headings = [combo.itemText(i) for i in range(combo.count()) if combo.itemData(i) is None]
+        assert "TIME SLICE" in headings and "TEMPORAL COLOUR" in headings
+        win.kind_combo.setCurrentIndex(win.kind_combo.findData("still"))
+        combo.setCurrentIndex(combo.findData("time_slice"))
+        pattern = win.param_form._widgets["pattern"]
+        pattern.setCurrentIndex(pattern.findData("radial"))
+        win.param_form._widgets["slices"].setValue(6)
+        win.param_form._widgets["mirror"].setChecked(True)
+        win.deflicker_check.setChecked(True)
+        job = win.current_job()
+        assert job.process == "time_slice" and job.params == {"pattern": "radial", "slices": 6, "mirror": True}
+        assert job.deflicker and "deflicker" in job.describe()
+        win.run_preview()
+        before = win._preview_request
+        wait_until(app, lambda: win._preview_shown and "Time slice" in win.view_status.text(), what="time-slice preview")
+        win.kind_combo.setCurrentIndex(win.kind_combo.findData("video"))
+        win.interp_combo.setCurrentIndex(win.interp_combo.findData(2))
+        assert win.current_job().interpolate == 2 and "2x smooth motion" in win.current_job().describe()
+        win.load_job(win.jobs[0])   # back to a classic job: new controls reset from the job
+        assert not win.deflicker_check.isChecked() and win.interp_combo.currentData() == 1
+
         # Queue files round-trip
         save_queue(tmp / "q.json", win.jobs)
         assert load_queue(tmp / "q.json") == win.jobs

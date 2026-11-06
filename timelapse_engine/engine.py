@@ -27,7 +27,7 @@ from .outputs import (FFmpegVideoSink, ImageSequenceSink, Sink, h264_preview, he
                       hevc_nvenc_master, prores_master)
 from .processors import Processor, create_processor
 from .progress import CancelToken, ProgressCallback, check_cancel, logger, report
-from .sources import FrameSource, ImageSequence, VideoSource
+from .sources import FrameSource, ImageSequence, SubsetSource, VideoSource
 
 ProcessorSpec = Union[str, Processor]
 
@@ -98,11 +98,17 @@ def iter_raw(source: FrameSource, index_lists: Sequence[Sequence[int]], pinned: 
             yield batch
 
 
-def _feed(feed, raw, gpu: bool, scale: float, chunk: int) -> None:
-    """Pass a raw host batch to ``feed`` as float 0-1 chunks, uploading one chunk at a time."""
+def _feed(feed, raw, gpu: bool, scale: float, chunk: int, gains=None, positions=None) -> None:
+    """Pass a raw host batch to ``feed`` as float 0-1 chunks, uploading one chunk at a time.
+    ``gains`` (indexed by sequence position) applies deflicker on the way."""
+    from .adjust import apply_gain
+
     for s in range(0, raw.shape[0], chunk):
         part = cp.asarray(raw[s:s + chunk]) if gpu else raw[s:s + chunk]
-        feed(backend.to_float(part, scale))
+        frames = backend.to_float(part, scale)
+        if gains is not None:
+            frames = apply_gain(frames, gains[positions[s:s + chunk]])
+        feed(frames)
 
 
 class MemoryPlan:
@@ -178,15 +184,22 @@ def iter_batches(source: FrameSource, batch_size: int) -> Iterator[np.ndarray]:
 
 def stack(source: FrameSource, processor: Processor, batch_size: Optional[int] = None,
           progress: Optional[ProgressCallback] = None, cancel: Optional[CancelToken] = None,
-          device: str = "auto") -> np.ndarray:
+          device: str = "auto", gains: Optional[np.ndarray] = None) -> np.ndarray:
     """Run ``processor`` over every frame of ``source`` and return the float 0-1 result (NumPy).
 
     ``batch_size`` defaults to a size based on frame size (about 1 GB of raw frames).
+    ``gains``: per-frame deflicker gains (see :mod:`timelapse_engine.adjust`).
     """
     gpu = use_gpu(processor, device)
     processor.reset()
-    n = len(source)
+    n_total = len(source)
     shape, dtype = source.probe()
+    needed = processor.frames_needed(n_total, shape)
+    positions = np.asarray(needed if needed is not None else range(n_total), dtype=np.int64)
+    if needed is not None:
+        source = SubsetSource(source, needed)  # read only the frames the effect uses
+    processor.begin(n_total, shape, positions.tolist())
+    n = len(source)
     scale = backend.scale_for(dtype)
     plan = MemoryPlan(processor, shape, dtype, gpu, n, batch_size)
     chunk = min(plan.batch, plan.chunk)
@@ -202,9 +215,9 @@ def stack(source: FrameSource, processor: Processor, batch_size: Optional[int] =
             label = processor.name + (f" (pass {pass_index + 1}/2)" if passes == 2 else "")
             done = 0
             report(progress, 0, n, label)
-            for raw in iter_raw(source, ranges, pinned=gpu):
+            for r, raw in zip(ranges, iter_raw(source, ranges, pinned=gpu)):
                 check_cancel(cancel)
-                _feed(feed, raw, gpu, scale, chunk)
+                _feed(feed, raw, gpu, scale, chunk, gains, positions[r.start:r.stop])
                 done += raw.shape[0]
                 report(progress, done, n, label)
         return asnumpy(processor.result()).astype(np.float32, copy=False)
@@ -213,11 +226,33 @@ def stack(source: FrameSource, processor: Processor, batch_size: Optional[int] =
         backend.free_gpu_memory()
 
 
+def _deflicker_gains(src: FrameSource, window: int, progress, cancel) -> np.ndarray:
+    from .adjust import deflicker_gains, measure_brightness
+
+    levels = measure_brightness(src, progress, cancel)
+    gains = deflicker_gains(levels, window)
+    logger.info("Deflicker: brightness varied %.1f%% frame to frame; corrections up to %.1f%%.",
+                100 * float(np.median(np.abs(np.diff(np.log(np.maximum(levels, 1e-6)))))) if len(levels) > 1 else 0,
+                100 * float(np.max(np.abs(gains - 1))))
+    return gains
+
+
+def _with_options(params: dict, deflicker_window=None, interpolate: int = 1) -> dict:
+    """Processor settings plus engine options, for the output's caption."""
+    out = dict(params)
+    if deflicker_window:
+        out["deflicker"] = deflicker_window
+    if interpolate and interpolate > 1:
+        out["interpolate"] = interpolate
+    return out
+
+
 def stack_to_file(source, process: ProcessorSpec, export_dir, export_name: Optional[str] = None,
                   ext: str = "tiff", batch_size: Optional[int] = None, overwrite: str = "increment",
                   timestamp_offset: Optional[timedelta] = timedelta(minutes=1),
                   progress: Optional[ProgressCallback] = None, cancel: Optional[CancelToken] = None,
-                  device: str = "auto", **params) -> Path:
+                  device: str = "auto", deflicker: bool = False, deflicker_window: int = 15,
+                  **params) -> Path:
     """Stack a whole sequence into one image and save it as ``<export_name>_<process>.<ext>``.
 
     * ``ext``: "tiff" (16-bit, keeps the last frame's XMP / Lightroom settings) or "jpg" (8-bit).
@@ -234,12 +269,14 @@ def stack_to_file(source, process: ProcessorSpec, export_dir, export_name: Optio
 
     logger.info("Stacking %d frames with %s on %s -> %s", len(src), processor.name,
                 "GPU" if use_gpu(processor, device) else "CPU", out_path.name)
-    result = stack(src, processor, batch_size, progress, cancel, device)
+    gains = _deflicker_gains(src, deflicker_window, progress, cancel) if deflicker else None
+    result = stack(src, processor, batch_size, progress, cancel, device, gains=gains)
 
     timestamp = src.latest_capture_time()
     if timestamp is not None and timestamp_offset is not None:
         timestamp += timestamp_offset
-    meta = metadata.summarise(src, range(len(src)), processor.name, params, kind="stack")
+    meta = metadata.summarise(src, range(len(src)), processor.name,
+                              _with_options(params, deflicker and deflicker_window), kind="stack")
     saved = files.save_image(out_path, result, timestamp=timestamp, metadata=meta)
     logger.info("Saved %s", saved)
     return saved
@@ -271,7 +308,8 @@ def _window_plan(n: int, blend: int, step: int, include_partial: bool,
 
 
 def _iter_window_frames(source: FrameSource, blend: int, step: int, include_partial: bool,
-                        gpu: bool, load_batch: int = 16) -> Iterator[Tuple[int, int, Dict[int, object]]]:
+                        gpu: bool, load_batch: int = 16,
+                        transform=None) -> Iterator[Tuple[int, int, Dict[int, object]]]:
     """Yield (start, end, cache) where cache[i] holds raw frame i, on the GPU if ``gpu`` else in RAM.
 
     Frames are decoded ``load_batch`` at a time, ahead of the windows that need
@@ -288,7 +326,8 @@ def _iter_window_frames(source: FrameSource, blend: int, step: int, include_part
                 raw = next(raw_batches)
                 for k, i in enumerate(loads[next_load]):
                     # One upload per frame so evicted frames free their memory individually.
-                    cache[i] = cp.asarray(raw[k]) if gpu else raw[k].copy()
+                    frame = cp.asarray(raw[k]) if gpu else raw[k].copy()
+                    cache[i] = transform(i, frame) if transform is not None else frame
                 loaded_max = loads[next_load][-1]
                 next_load += 1
             # Keep the previous window's frames too: running sums subtract them.
@@ -312,6 +351,7 @@ def _run_window(processor: Processor, frames: list, scale: float, chunk: int, gp
     """Run a processor over one window of raw frames (on the GPU or in RAM).
     With ``gpu`` the result is a GPU array; RAM-cached frames are uploaded a chunk at a time."""
     processor.reset()
+    processor.begin(len(frames), tuple(frames[0].shape), range(len(frames)))
     feeds = [processor.update] + ([processor.update_second_pass] if processor.two_pass else [])
     for pass_index, feed in enumerate(feeds):
         if pass_index == 1:
@@ -337,15 +377,38 @@ def process_window(processor: Processor, frames, device: str = "auto") -> np.nda
 def render_windows(source, process: ProcessorSpec, sinks: Sequence[Sink], blend: int = 1, step: int = 1,
                    include_partial: bool = True, progress: Optional[ProgressCallback] = None,
                    cancel: Optional[CancelToken] = None, device: str = "auto",
-                   batch_size: Optional[int] = None, **params) -> int:
+                   batch_size: Optional[int] = None, deflicker: bool = False, deflicker_window: int = 15,
+                   interpolate: int = 1, **params) -> int:
     """Blend each rolling window of ``blend`` frames (advancing by ``step``) and write
-    the result to every sink. Returns the number of output frames."""
+    the result to every sink. Returns the number of blended output frames.
+
+    deflicker: even out frame-to-frame brightness first (see :mod:`timelapse_engine.adjust`).
+    interpolate: add motion-compensated in-between frames (2 = twice as many frames).
+    """
+    from .adjust import apply_gain
+
     src = open_source(source)
     processor = _make_processor(process, params)
     gpu = use_gpu(processor, device)
     shape, dtype = src.probe()
     scale = backend.scale_for(dtype)
+    transform = None
+    if deflicker:
+        gains = _deflicker_gains(src, deflicker_window, progress, cancel)
+        raw_scale = scale
+
+        def transform(i, frame):  # corrected frames are cached as 16-bit
+            return backend.to_uint16(apply_gain(backend.to_float(frame[None], raw_scale), gains[[i]])[0])
+
+        dtype, scale = np.dtype(np.uint16), 1.0 / 65535
     plan = MemoryPlan(processor, shape, dtype, gpu, len(src), batch_size, window=blend, step=step)
+    interpolator = None
+    if interpolate and interpolate > 1:
+        from .interpolate import FrameInterpolator
+
+        interpolator = FrameInterpolator(interpolate)
+    prev_float = None
+    caption_params = _with_options(params, deflicker and deflicker_window, interpolate)
     total = len(window_starts(len(src), blend, step, include_partial))
     logger.info("Rendering %d frames from %d sources with %s on %s (blend %d, step %d; %s).",
                 total, len(src), processor.name, "GPU" if gpu else "CPU", blend, step, plan)
@@ -358,7 +421,8 @@ def render_windows(source, process: ProcessorSpec, sinks: Sequence[Sink], blend:
     try:
         processor.reset()
         report(progress, 0, total, processor.name)
-        frames_iter = _iter_window_frames(src, blend, step, include_partial, plan.cache_on_gpu, plan.batch)
+        frames_iter = _iter_window_frames(src, blend, step, include_partial, plan.cache_on_gpu, plan.batch,
+                                          transform)
         for start, end, cache in frames_iter:
             check_cancel(cancel)
             if blend == 1:
@@ -377,9 +441,16 @@ def render_windows(source, process: ProcessorSpec, sinks: Sequence[Sink], blend:
                 result = processor.window_result(scale)
             else:
                 result = _run_window(processor, [cache[i] for i in range(start, end)], scale, plan.chunk, gpu)
-            frame16 = backend.to_uint16(result)  # stays on the GPU; sinks convert/download what they need
-            meta = (metadata.summarise(src, range(start, end), processor.name, params, kind="window")
+            meta = (metadata.summarise(src, range(start, end), processor.name, caption_params, kind="window")
                     if any(getattr(s, "wants_metadata", False) for s in sinks) else None)
+            if interpolator is not None:
+                current = result if result.dtype.kind == "f" else backend.to_float(result, scale)
+                if prev_float is not None:
+                    for between in interpolator.in_between(prev_float, current):
+                        for sink in sinks:
+                            sink.write(backend.to_uint16(between), meta)
+                prev_float = current
+            frame16 = backend.to_uint16(result)  # stays on the GPU; sinks convert/download what they need
             for sink in sinks:
                 sink.write(frame16, meta)
             written += 1
@@ -411,7 +482,8 @@ def render_video(source, process: ProcessorSpec, export_dir, export_name: Option
                  master: Optional[str] = "prores", preview_1080p: bool = True, preview_4k: bool = False,
                  ffmpeg_path: str = "ffmpeg", overwrite: str = "increment", include_partial: bool = True,
                  progress: Optional[ProgressCallback] = None, cancel: Optional[CancelToken] = None,
-                 device: str = "auto", batch_size: Optional[int] = None, **params) -> list:
+                 device: str = "auto", batch_size: Optional[int] = None, deflicker: bool = False,
+                 deflicker_window: int = 15, interpolate: int = 1, **params) -> list:
     """Render a rolling-window blend straight to video.
 
     master: "prores" (ProRes 422 HQ .mov, CPU encoder, ~8 fps at 20 MP),
@@ -444,22 +516,26 @@ def render_video(source, process: ProcessorSpec, export_dir, export_name: Option
 
     name = process.name if isinstance(process, Processor) else process
     n_out = len(window_starts(len(src), blend, step, include_partial))
-    meta = metadata.summarise(src, range(len(src)), name, params, kind="video", blend=blend, step=step,
+    meta = metadata.summarise(src, range(len(src)), name, _with_options(params, deflicker and deflicker_window,
+                                                                            interpolate),
+                              kind="video", blend=blend, step=step,
                               fps=fps, outputs=n_out)
     sink = FFmpegVideoSink(outputs, fps=fps, ffmpeg_path=ffmpeg_path, overwrite=overwrite, metadata=meta)
     render_windows(src, process, [sink], blend, step, include_partial, progress, cancel, device, batch_size,
-                   **params)
+                   deflicker=deflicker, deflicker_window=deflicker_window, interpolate=interpolate, **params)
     return sink.outputs
 
 
 def render_frames(source, process: ProcessorSpec, export_dir, export_name: Optional[str] = None,
                   blend: int = 1, step: int = 1, ext: str = "tiff", overwrite: str = "increment",
                   include_partial: bool = True, progress: Optional[ProgressCallback] = None,
-                  cancel: Optional[CancelToken] = None, device: str = "auto", **params) -> list:
+                  cancel: Optional[CancelToken] = None, device: str = "auto", deflicker: bool = False,
+                  deflicker_window: int = 15, interpolate: int = 1, **params) -> list:
     """Render a rolling-window blend to numbered still images. Returns the files written."""
     src = open_source(source)
     sink = ImageSequenceSink(export_dir, export_name or src.name, ext, overwrite)
-    render_windows(src, process, [sink], blend, step, include_partial, progress, cancel, device, None, **params)
+    render_windows(src, process, [sink], blend, step, include_partial, progress, cancel, device, None,
+                   deflicker=deflicker, deflicker_window=deflicker_window, interpolate=interpolate, **params)
     return sink.outputs
 
 

@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
 from .. import __version__, backend
 from ..jobs import (KINDS, MASTERS, Job, SourceCache, default_export, is_video, load_queue, render_preview,
                     save_queue)
-from ..processors import PROCESSORS
+from ..processors import CATEGORY_ORDER, PROCESSORS
 from ..progress import CancelToken, logger
 from .widgets import ImageView, ParamForm, PathPicker, Timeline
 from .worker import QtLogHandler, QueueRunner, TaskRunner
@@ -46,6 +46,17 @@ DISPLAY_NAMES = {
     "temporal_entropy": "Temporal entropy",
     "optical_flow_accum": "Optical flow",
     "motion_overlay": "Motion overlay (clean plate + movers)",
+    "change_entropy": "Change entropy (turbulence vs drift)",
+    "colour_entropy": "Colour entropy (colour vs brightness)",
+    "temporal_shape": "Temporal shape (skewness / kurtosis)",
+    "time_of_peak": "Time of peak (when it happened)",
+    "rhythm_map": "Rhythm map (repeating changes)",
+    "eigen_colour": "Eigen-colour (patterns of change)",
+    "memory_map": "Memory map (how long pixels stay similar)",
+    "time_slice": "Time slice",
+    "temporal_denoise": "Temporal denoise (video)",
+    "comet_trails": "Comet trails",
+    "clipped_average": "Clipped average (no planes/people)",
 }
 VIDEO_FILTER = "Video files (*.mp4 *.mov *.mkv *.avi *.m4v *.mts *.mxf);;All files (*)"
 PREVIEW_SIZES = {"Fast (960 px)": 960, "Normal (1280 px)": 1280, "Large (1920 px)": 1920}
@@ -179,8 +190,19 @@ class MainWindow(QMainWindow):
         self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
         fx_form.addRow("Create", self.kind_combo)
         self.process_combo = QComboBox()
-        for name in PROCESSORS:
-            self.process_combo.addItem(DISPLAY_NAMES.get(name, name), name)
+        self.process_combo.setMaxVisibleItems(30)
+        categories = CATEGORY_ORDER + sorted({c.category for c in PROCESSORS.values()} - set(CATEGORY_ORDER))
+        for category in categories:
+            names = [n for n, c in PROCESSORS.items() if c.category == category]
+            if not names:
+                continue
+            self.process_combo.addItem(category.upper())        # group heading (not selectable)
+            heading = self.process_combo.model().item(self.process_combo.count() - 1)
+            heading.setEnabled(False)
+            heading.setSelectable(False)
+            for name in names:
+                self.process_combo.addItem("    " + DISPLAY_NAMES.get(name, name), name)
+        self.process_combo.setCurrentIndex(self.process_combo.findData("average"))
         self.process_combo.currentIndexChanged.connect(self._on_process_changed)
         fx_form.addRow("Effect", self.process_combo)
         self.process_desc = QLabel()
@@ -201,6 +223,28 @@ class MainWindow(QMainWindow):
         fx_form.addRow(self._blend_label, self.blend_spin)
         fx_form.addRow(self._step_label, self.step_spin)
         fx_form.addRow(self._fps_label, self.fps_spin)
+        self.interp_combo = QComboBox()
+        self.interp_combo.addItem("Off", 1)
+        for k in (2, 3, 4):
+            self.interp_combo.addItem(f"{k}x (motion-compensated in-betweens)", k)
+        self.interp_combo.setToolTip("Adds in-between frames estimated from the motion: smoother clouds, or slow "
+                                     "motion at the same frame rate.")
+        self.interp_combo.currentIndexChanged.connect(self._on_settings_changed)
+        self._interp_label = QLabel("Smooth motion")
+        fx_form.addRow(self._interp_label, self.interp_combo)
+        flicker_row = QHBoxLayout()
+        self.deflicker_check = QCheckBox("Deflicker")
+        self.deflicker_check.setToolTip("Evens out frame-to-frame brightness flicker before the effect is applied.")
+        self.deflicker_spin = QSpinBox(minimum=3, maximum=301, value=15)
+        self.deflicker_spin.setToolTip("Smoothing width in frames. Larger removes slower flicker but follows real "
+                                       "changes (like sunset) less closely.")
+        self.deflicker_spin.setSuffix(" frames")
+        self.deflicker_check.toggled.connect(self.deflicker_spin.setEnabled)
+        self.deflicker_spin.setEnabled(False)
+        for w in (self.deflicker_check, self.deflicker_spin):
+            flicker_row.addWidget(w)
+        flicker_row.addStretch(1)
+        fx_form.addRow(flicker_row)
         self.output_count = QLabel()
         self.output_count.setStyleSheet("color: palette(mid);")
         fx_form.addRow(self.output_count)
@@ -423,6 +467,9 @@ class MainWindow(QMainWindow):
             preview_4k=self.p4k_check.isChecked(),
             device=self.device_combo.currentData(),
             overwrite=self.overwrite_combo.currentData(),
+            deflicker=self.deflicker_check.isChecked(),
+            deflicker_window=self.deflicker_spin.value(),
+            interpolate=self.interp_combo.currentData(),
         )
 
     def load_job(self, job: Job, load_source: bool = True):
@@ -442,6 +489,9 @@ class MainWindow(QMainWindow):
             self.fps_spin.setValue(int(round(job.fps)))
             self.p1080_check.setChecked(job.preview_1080p)
             self.p4k_check.setChecked(job.preview_4k)
+            self.deflicker_check.setChecked(job.deflicker)
+            self.deflicker_spin.setValue(job.deflicker_window)
+            self.interp_combo.setCurrentIndex(max(0, self.interp_combo.findData(job.interpolate)))
             self.export_picker.set_path(job.export_dir)
             self.name_edit.setText(job.export_name)
             self._pending_range = (job.first_frame, job.end_frame)
@@ -689,7 +739,8 @@ class MainWindow(QMainWindow):
     def _on_kind_changed(self, *_):
         kind = self.kind_combo.currentData()
         rolling = kind in ("video", "frames")
-        for w in (self._blend_label, self.blend_spin, self._step_label, self.step_spin):
+        for w in (self._blend_label, self.blend_spin, self._step_label, self.step_spin, self._interp_label,
+                  self.interp_combo):
             w.setVisible(rolling)
         for w in (self._fps_label, self.fps_spin, self._master_label, self.master_combo, self._previews_label,
                   self.p1080_check, self.p4k_check):
@@ -700,6 +751,8 @@ class MainWindow(QMainWindow):
 
     def _on_process_changed(self, *_):
         name = self.process_combo.currentData()
+        if name is None:  # a group heading
+            return
         self.process_desc.setText(PROCESSORS[name].description)
         if not self._loading_form:
             self.param_form.set_processor(name)
@@ -722,6 +775,8 @@ class MainWindow(QMainWindow):
             self.output_count.setText(f"{n} frames → 1 image")
         else:
             outs = len(range(0, n, job.step))
+            if job.interpolate > 1 and outs > 1:
+                outs = (outs - 1) * job.interpolate + 1
             extra = f" · {outs / job.fps:.1f} s at {job.fps:g} fps" if job.kind == "video" else ""
             self.output_count.setText(f"{n} frames → {outs} output frames{extra}")
 

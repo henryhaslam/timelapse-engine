@@ -71,19 +71,78 @@ See [`examples/run_pipeline.py`](examples/run_pipeline.py) for the full batch wo
 | `progress.py` | Progress callback, `CancelToken`, console progress bar |
 | `stabilise.py` | Point picking, LK tracking, translation stabilisation |
 | `jobs.py` | `Job` (one saveable render description), queue files, previews, parameter metadata |
+| `effects.py` | Entropy family, temporal colour maps, time-slice, clean-up and trail effects |
+| `adjust.py` | Deflicker (brightness measurement, smoothing, linear-light gain) |
+| `interpolate.py` | Motion-compensated frame interpolation |
 | `gui/` | PySide6 desktop app |
 
 The engine never prints or calls `input()`. Progress goes to a `progress(done, total, message)` callback, and a
 `CancelToken` stops a job between batches, which is what a GUI needs.
 
-## Processors
+## Effects
 
-`average`, `maximum`, `minimum`, `median`, `mode`, `temporal_contrast`, `temporal_std`, `temporal_gradient`,
-`temporal_hue_motion`, `temporal_entropy`, `optical_flow_accum`, `motion_overlay`. `te.list_processors()` gives
-descriptions.
+The same effect code is used for still stacks and video windows, so a blended video frame matches the still you
+would get from the same frames. Every effect runs on the GPU except `median`, `mode` and `optical_flow_accum`.
+`te.list_processors()` gives descriptions. In the app, the settings for each effect appear with tooltips.
 
-The same processor code is used for still stacks and video windows, so a blended video frame matches the still you
-would get from the same frames.
+| Group | Effect | What it shows |
+|---|---|---|
+| Stacks | `average`, `maximum`, `minimum`, `median`, `mode` | classic long exposure, light trails, clean plate |
+| Temporal colour | `temporal_entropy` | how varied each colour channel was: moving clouds and water go vivid, static scenery black |
+| | `change_entropy` | entropy of frame-to-frame *changes*: turbulence (boiling cloud, choppy water) vs smooth drift |
+| | `colour_entropy` | entropy of colour and brightness separately (R = red/cyan shifts, G = brightness, B = blue/yellow shifts) |
+| | `temporal_shape` | skewness (mostly dark with bright moments, or the opposite) or kurtosis (rare spikes) per channel |
+| | `temporal_contrast`, `temporal_std`, `temporal_gradient` | range, variation and accumulated change |
+| Motion and time | `time_of_peak` | hue = *when* each pixel was brightest / darkest / changed most |
+| | `rhythm_map` | hue = dominant repeating period (waves, traffic, blinking lights, drifting cloud) |
+| | `eigen_colour` | the 3 strongest patterns of change (PCA) as red, green and blue |
+| | `memory_map` | how long pixels stay similar, at 3 time scales as RGB |
+| | `temporal_hue_motion`, `optical_flow_accum`, `motion_overlay` | motion coloured by time or direction; movers on a clean plate |
+| Time slice | `time_slice` | each part of the image from a different moment (see below) |
+| Clean-up and trails | `temporal_denoise` | motion-aware median for videos (blend 3-9) |
+| | `comet_trails` | maximum where older light fades: tapering star/light trails |
+| | `clipped_average` | average that ignores outliers (planes, people, birds) |
+
+All the entropy effects accept these settings:
+
+- **`renyi_order`** (alpha): 1 is standard entropy. Below 1 lifts rare events; above 1 keeps only the dominant changes.
+- **`neighbourhood`**: also counts the pixels this many px around each pixel, for a smoother, painterly look.
+- **`hist_bins`** and **`noise_threshold`**.
+
+Speed at 20 MP / 16-bit on the RTX 3080 Ti: 28-73 fps for every new effect (170 fps for a banded time-slice,
+which reads only the frames it uses), within about 8 GB of VRAM.
+
+### Time slice
+
+`time_slice` replaces `slice_functions.py`, with these differences:
+
+- No width or divisibility limits, and every frame can contribute.
+- Frames are in capture-time order.
+- It works for stills and as a rolling-window video.
+
+| Setting | |
+|---|---|
+| `pattern` | `left_to_right`, `top_to_bottom`, `diagonal` (at `angle`), `radial` (centre outwards), `circular` (clock sweep from `angle`), `brightness` (bright parts of the first frame come from late frames) |
+| `slices` | `0` = smooth: every column/ring from its own moment, blended between neighbouring frames. `N` = N bands, one frame each; only those N frames are read |
+| `feather` | 0-1: band edges blend through the frames in between |
+| `reverse`, `mirror` | run time backwards; there and back (e.g. night in the middle) |
+| `curve` | below 1 gives more of the image to the end of the sequence, above 1 to the start |
+
+```python
+te.stack_to_file(r"E:\TL\shoot", "time_slice", r"E:\TL", pattern="radial", slices=12, feather=0.3, mirror=True)
+```
+
+### Deflicker and smooth motion
+
+These options apply to any job (`deflicker=True` on `stack_to_file`, `render_video` or `render_frames`, or the
+checkbox in the app).
+
+- **Deflicker:** first measures each frame's brightness from fast reduced-size decodes. It smooths that curve over
+  `deflicker_window` frames and corrects each frame in linear light, like a small exposure change. Your G10
+  sequence measured 2.5 % frame-to-frame flicker.
+- **Smooth motion** (`interpolate=2|3|4`, videos and image sequences): adds motion-compensated in-between frames.
+  Optical flow is computed at 960 px and warped at full resolution on the GPU. It suits clouds and water; fast
+  small objects can warp.
 
 ## Output metadata
 
@@ -206,5 +265,5 @@ Clean-up:
 ## Tests
 
 ```bash
-pytest            # or: python tests/test_engine.py && python tests/test_gui.py
+pytest            # or: python tests/test_engine.py && python tests/test_effects.py && python tests/test_gui.py
 ```

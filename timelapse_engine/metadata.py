@@ -38,6 +38,10 @@ PROCESS_LABELS = {
     "temporal_contrast": "Temporal contrast", "temporal_std": "Temporal variation",
     "temporal_gradient": "Temporal gradient", "temporal_hue_motion": "Motion coloured by time",
     "temporal_entropy": "Temporal entropy", "optical_flow_accum": "Optical flow", "motion_overlay": "Motion overlay",
+    "change_entropy": "Change entropy", "colour_entropy": "Colour entropy", "temporal_shape": "Temporal shape",
+    "time_of_peak": "Time of peak", "rhythm_map": "Rhythm map", "eigen_colour": "Eigen-colour",
+    "memory_map": "Memory map", "time_slice": "Time slice", "temporal_denoise": "Temporal denoise",
+    "comet_trails": "Comet trails", "clipped_average": "Clipped average",
 }
 
 

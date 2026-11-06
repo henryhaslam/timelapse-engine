@@ -46,6 +46,7 @@ class ParamSpec:
     maximum: float = 1
     step: float = 1
     help: str = ""
+    choices: tuple = ()          # for text settings: the allowed values
 
 
 # label, min, max, step, help
@@ -65,6 +66,45 @@ _PARAM_HINTS = {
     "iterations": ("Iterations", 1, 20, 1, "Optical flow iterations per level."),
     "poly_n": ("Poly neighbourhood", 5, 9, 2, "Optical flow polynomial expansion size (5 or 7)."),
     "poly_sigma": ("Poly sigma", 0.5, 2.0, 0.1, "Optical flow polynomial smoothing."),
+    # entropy family
+    "renyi_order": ("Renyi order (alpha)", 0.1, 10.0, 0.1,
+                    "1 = standard entropy. Below 1 lifts rare events (birds, a passing light, a bright cloud "
+                    "edge); above 1 keeps only the dominant changes."),
+    "neighbourhood": ("Neighbourhood (px)", 0, 25, 1,
+                      "Also count values from pixels this far around each pixel: smoother, more painterly."),
+    "change_range": ("Change range (0-255)", 4, 255, 4,
+                     "Frame-to-frame change that spans the histogram. Smaller = more sensitive to small changes."),
+    "chroma_gain": ("Colour sensitivity", 1.0, 16.0, 0.5, "Amplifies colour shifts before measuring them."),
+    "statistic": ("Statistic", 0, 0, 0,
+                  "Skewness: mostly dark with bright moments vs the opposite. Kurtosis: rare spikes vs steady change."),
+    "gain": ("Contrast", 0.2, 10.0, 0.1, "Lower = stronger colours."),
+    # motion and time
+    "event": ("Colour by when it was", 0, 0, 0, "Which moment sets each pixel's colour."),
+    "hue_span": ("Hue range (degrees)", 30.0, 360.0, 10.0,
+                 "How far round the colour wheel the sequence spans (360 wraps back to the start colour)."),
+    "min_period": ("Shortest rhythm (frames)", 2.0, 1000.0, 1.0, "Fastest repeating change that gets its own colour."),
+    "max_period": ("Longest rhythm (frames)", 3.0, 5000.0, 5.0, "Slowest repeating change that gets its own colour."),
+    "samples": ("Sample pixels", 4096, 1048576, 4096, "Pixels used to find the patterns (more = slower, steadier)."),
+    "mode": ("Mode", 0, 0, 0, "Magnitude: static areas black. Signed: static areas grey, colours show direction."),
+    "base_scale": ("Shortest time scale (frames)", 1, 100, 1, "Red channel's time scale."),
+    "ratio": ("Scale step", 2, 16, 1, "Green = base x step, blue = base x step x step."),
+    # time slice
+    "pattern": ("Pattern", 0, 0, 0, "Which way time runs across the image."),
+    "slices": ("Bands (0 = smooth)", 0, 2000, 1, "0: every column/ring from its own moment. N: N bands, one frame each."),
+    "feather": ("Feather", 0.0, 1.0, 0.05, "Blend between bands (fraction of a band)."),
+    "angle": ("Angle (degrees)", -360.0, 360.0, 5.0, "Direction for diagonal; start position for circular."),
+    "reverse": ("Reverse time", 0, 1, 1, "Run time the other way across the image."),
+    "mirror": ("Mirror (there and back)", 0, 1, 1, "Time goes out and back, e.g. night in the middle."),
+    "curve": ("Timing curve", 0.2, 5.0, 0.1, "Below 1: more of the image from late frames. Above 1: from early frames."),
+    # clean-up and trails
+    "trail_length": ("Trail length (frames)", 1.0, 1000.0, 1.0, "How many frames a trail takes to fade."),
+    "sigma": ("Outlier threshold (sigma)", 0.5, 5.0, 0.1, "Values further than this many std devs are ignored."),
+}
+_PARAM_CHOICES = {
+    "statistic": ("skewness", "kurtosis"),
+    "event": ("biggest_change", "brightest", "darkest"),
+    "mode": ("magnitude", "signed"),
+    "pattern": ("left_to_right", "top_to_bottom", "diagonal", "radial", "circular", "brightness"),
 }
 _HIDDEN_PARAMS = {"use_gpu"}
 
@@ -78,7 +118,8 @@ def processor_params(name: str) -> List[ParamSpec]:
         kind = type(p.default) if p.default is not None else float
         label, lo, hi, step, help_text = _PARAM_HINTS.get(p.name, (p.name.replace("_", " ").capitalize(),
                                                                   0, 1000, 1, ""))
-        specs.append(ParamSpec(p.name, label, p.default, kind, lo, hi, step, help_text))
+        specs.append(ParamSpec(p.name, label, p.default, kind, lo, hi, step, help_text,
+                               _PARAM_CHOICES.get(p.name, ()) if kind is str else ()))
     return specs
 
 
@@ -106,6 +147,9 @@ class Job:
     preview_4k: bool = False
     device: str = "auto"
     overwrite: str = "increment"
+    deflicker: bool = False             # even out frame-to-frame brightness first
+    deflicker_window: int = 15
+    interpolate: int = 1                # video / image sequence: in-between frames (2 = double)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -155,7 +199,10 @@ class Job:
             what = f"{self.process} blend {self.blend} step {self.step} -> {' + '.join(outs)}"
         else:
             what = f"{self.process} blend {self.blend} step {self.step} -> {self.ext.upper()} frames"
-        return f"{KINDS.get(self.kind, self.kind)}: {name}{rng}, {what}"
+        extras = [x for x, on in (("deflicker", self.deflicker),
+                                  (f"{self.interpolate}x smooth motion", self.kind != "still" and self.interpolate > 1))
+                  if on]
+        return f"{KINDS.get(self.kind, self.kind)}: {name}{rng}, {what}" + (f" ({', '.join(extras)})" if extras else "")
 
 
 def default_export(source: str) -> Tuple[str, str]:
@@ -222,16 +269,19 @@ def run_job(job: Job, sources: Optional[SourceCache] = None, progress: Optional[
     try:
         src = job_source(job, sources)
         name = job.default_name()
-        common = dict(progress=progress, cancel=cancel, device=job.device, **job.params)
+        common = dict(progress=progress, cancel=cancel, device=job.device, deflicker=job.deflicker,
+                      deflicker_window=job.deflicker_window, **job.params)
         if job.kind == "still":
             return [engine.stack_to_file(src, job.process, job.export_dir, name, ext=job.ext,
                                          overwrite=job.overwrite, **common)]
         if job.kind == "video":
             return engine.render_video(src, job.process, job.export_dir, name, blend=job.blend, step=job.step,
                                        fps=job.fps, master=job.master, preview_1080p=job.preview_1080p,
-                                       preview_4k=job.preview_4k, overwrite=job.overwrite, **common)
+                                       preview_4k=job.preview_4k, overwrite=job.overwrite,
+                                       interpolate=job.interpolate, **common)
         return engine.render_frames(src, job.process, Path(job.export_dir) / f"{name}_{job.process}_frames", name,
-                                    blend=job.blend, step=job.step, ext=job.ext, overwrite=job.overwrite, **common)
+                                    blend=job.blend, step=job.step, ext=job.ext, overwrite=job.overwrite,
+                                    interpolate=job.interpolate, **common)
     finally:
         if own_cache:
             sources.close()

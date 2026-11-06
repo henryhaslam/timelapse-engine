@@ -355,6 +355,35 @@ def decode_into(path, out: np.ndarray) -> None:
     out[...] = as_hwc(img) if img is not None and img.ndim == 2 else load_raw(path)
 
 
+def load_small(path, max_side: int) -> np.ndarray:
+    """A downscaled copy (longest side ``max_side``), native dtype, RGB (H, W, C).
+
+    JPEGs are decoded at 1/2, 1/4 or 1/8 size directly by libjpeg, which is
+    several times faster than a full decode - used for previews and deflicker.
+    """
+    path = str(path)
+    img = None
+    if not path.lower().endswith(TIFF_EXTENSIONS):
+        try:
+            with Image.open(path) as im:
+                longest = max(im.size)
+            factor = next((f for f in (8, 4, 2) if longest / f >= max_side), 1)
+            flags = {1: cv2.IMREAD_COLOR, 2: cv2.IMREAD_REDUCED_COLOR_2, 4: cv2.IMREAD_REDUCED_COLOR_4,
+                     8: cv2.IMREAD_REDUCED_COLOR_8}[factor] | cv2.IMREAD_IGNORE_ORIENTATION
+            bgr = cv2.imdecode(np.fromfile(path, dtype=np.uint8), flags)
+            if bgr is not None:
+                img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) if bgr.ndim == 3 else bgr[:, :, None]
+        except Exception:
+            img = None
+    if img is None:
+        img = load_raw(path)
+    h, w = img.shape[:2]
+    if max(h, w) > max_side:
+        s = max_side / max(h, w)
+        img = cv2.resize(img, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
+    return as_hwc(img)
+
+
 def load_image(path) -> np.ndarray:
     """Load a JPEG or TIFF as float32 0-1, (H, W, C).
 

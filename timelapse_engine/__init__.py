@@ -22,6 +22,6 @@ from .progress import CancelToken, Cancelled, ConsoleProgress, enable_console_lo
 from .jobs import Job, load_queue, run_job, save_queue
 from .sources import FrameSource, ImageSequence, SubsetSource, VideoSource
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [name for name in dir() if not name.startswith("_")]

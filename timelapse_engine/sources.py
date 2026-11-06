@@ -39,6 +39,21 @@ class FrameSource(ABC):
         for k, frame in enumerate(self.read_raw(indices)):
             out[k] = files.as_hwc(frame)
 
+    def read_small(self, indices: Sequence[int], max_side: int) -> List[np.ndarray]:
+        """Downscaled frames (native dtype) with the longest side ``max_side``."""
+        import cv2
+
+        out = []
+        for frame in self.read_raw(indices):
+            frame = files.as_hwc(frame)
+            h, w = frame.shape[:2]
+            if max(h, w) > max_side:
+                s = max_side / max(h, w)
+                frame = files.as_hwc(cv2.resize(frame, (max(1, round(w * s)), max(1, round(h * s))),
+                                                interpolation=cv2.INTER_AREA))
+            out.append(frame)
+        return out
+
     def read_many(self, indices: Sequence[int]) -> List[np.ndarray]:
         """Frames as float32 0-1 (convenience; the engine uses the raw methods)."""
         return [files.to_float(f) for f in self.read_raw(indices)]
@@ -144,6 +159,9 @@ class ImageSequence(FrameSource):
     def read_raw(self, indices: Sequence[int]) -> List[np.ndarray]:
         return list(self.pool.map(files.load_raw, [self.paths[i] for i in indices]))
 
+    def read_small(self, indices: Sequence[int], max_side: int) -> List[np.ndarray]:
+        return list(self.pool.map(lambda i: files.load_small(self.paths[i], max_side), indices))
+
     def read_into(self, indices: Sequence[int], out: np.ndarray) -> None:
         jobs = [self.pool.submit(files.decode_into, self.paths[i], out[k]) for k, i in enumerate(indices)]
         for job in jobs:
@@ -208,8 +226,20 @@ class SubsetSource(FrameSource):
         small = cv2.resize(frame, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
         return files.as_hwc(small)
 
+    def probe(self):
+        if not self.max_side:
+            return self.source.probe()  # same frames, no need to decode one again
+        return super().probe()
+
     def read_raw(self, indices: Sequence[int]) -> List[np.ndarray]:
-        return [self._resize(f) for f in self.source.read_raw([self.indices[i] for i in indices])]
+        mapped = [self.indices[i] for i in indices]
+        if self.max_side:
+            return self.source.read_small(mapped, self.max_side)
+        return [files.as_hwc(f) for f in self.source.read_raw(mapped)]
+
+    def read_small(self, indices: Sequence[int], max_side: int) -> List[np.ndarray]:
+        side = min(max_side, self.max_side) if self.max_side else max_side
+        return self.source.read_small([self.indices[i] for i in indices], side)
 
     def read_into(self, indices: Sequence[int], out: np.ndarray) -> None:
         if self.max_side is None or self.probe()[0] == self.source.probe()[0]:

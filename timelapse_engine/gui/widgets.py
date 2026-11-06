@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGraphicsPixmapItem,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGraphicsPixmapItem,
                                QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                QSizePolicy, QSpinBox, QToolTip, QWidget)
 
@@ -276,7 +276,13 @@ class ParamForm(QWidget):
         self._specs = processor_params(name)
         for spec in self._specs:
             value = values.get(spec.name, spec.default)
-            if spec.kind is bool:
+            if spec.choices:
+                w = QComboBox()
+                for choice in spec.choices:
+                    w.addItem(choice.replace("_", " ").capitalize(), choice)
+                w.setCurrentIndex(max(0, w.findData(value)))
+                w.currentIndexChanged.connect(self.changed)
+            elif spec.kind is bool:
                 w = QCheckBox()
                 w.setChecked(bool(value))
                 w.toggled.connect(self.changed)
@@ -307,7 +313,9 @@ class ParamForm(QWidget):
         out = {}
         for spec in self._specs:
             w = self._widgets[spec.name]
-            if isinstance(w, QCheckBox):
+            if isinstance(w, QComboBox):
+                v = w.currentData()
+            elif isinstance(w, QCheckBox):
                 v = w.isChecked()
             else:
                 v = w.value()

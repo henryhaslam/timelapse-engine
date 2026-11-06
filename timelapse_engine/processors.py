@@ -19,7 +19,7 @@ array; use ``backend.asnumpy`` (the engine does this for you).
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Type
+from typing import Dict, List, Optional, Type
 
 import cv2
 import numpy as np
@@ -95,7 +95,18 @@ class Processor:
     two_pass = False
     gpu = True
     description = ""
+    category = "Stacks"
     state_frames = 2.0  # memory held between updates, in units of one float32 frame
+
+    def begin(self, n_frames: int, frame_shape, indices) -> None:
+        """Called after reset() and before the first update(): ``n_frames`` in the
+        sequence, and ``indices`` - the sequence position of each frame that will
+        arrive, in order (effects that depend on *when* a frame was taken use it)."""
+
+    def frames_needed(self, n_frames: int, frame_shape) -> Optional[List[int]]:
+        """Sequence positions this effect actually uses (None = all). Lets e.g. a
+        30-band time-slice read 30 frames instead of the whole sequence."""
+        return None
 
     def state_bytes(self, frame_shape) -> int:
         """Device memory the processor's running state needs (used to size chunks)."""
@@ -301,6 +312,7 @@ class ModeProcessor(Processor):
 
 class TemporalContrastProcessor(Processor):
     name = "temporal_contrast"
+    category = "Temporal colour"
     description = "(max - min) / (max + min) per pixel: how much each pixel changed relative to its brightness."
     state_frames = 4.0
 
@@ -325,6 +337,7 @@ class TemporalContrastProcessor(Processor):
 
 class TemporalStdProcessor(Processor):
     name = "temporal_std"
+    category = "Temporal colour"
     description = "Standard deviation per pixel, normalised so the most variable pixel is white."
     state_frames = 8.0
     sliding = True
@@ -357,14 +370,17 @@ class TemporalStdProcessor(Processor):
         return _normalise_peak(xp.sqrt(xp.maximum(var, 0.0)))
 
     def update(self, batch):
-        # float64 here: E[x²] - E[x]² cancels badly in float32 (a static pixel would get noise)
-        b = batch.astype(xp_of(batch).float64)
-        s, sq = b.sum(axis=0), (b * b).sum(axis=0)
+        # float64 here: E[x²] - E[x]² cancels badly in float32 (a static pixel would get noise).
+        # One frame at a time keeps the float64 temporaries small.
+        xp = xp_of(batch)
         if self.total is None:
-            self.total, self.total_sq = s, sq
-        else:
-            self.total += s
-            self.total_sq += sq
+            self.total = xp.zeros(batch.shape[1:], xp.float64)
+            self.total_sq = xp.zeros(batch.shape[1:], xp.float64)
+        for frame in batch:
+            f = frame.astype(xp.float64)
+            self.total += f
+            f *= f
+            self.total_sq += f
         self.count += batch.shape[0]
 
     def result(self):
@@ -375,6 +391,7 @@ class TemporalStdProcessor(Processor):
 
 class TemporalGradientProcessor(Processor):
     name = "temporal_gradient"
+    category = "Temporal colour"
     description = "Sum of frame-to-frame changes, normalised and auto-brightened."
     state_frames = 3.0
 
@@ -407,6 +424,7 @@ class TemporalGradientProcessor(Processor):
 
 class TemporalHueMotionProcessor(Processor):
     name = "temporal_hue_motion"
+    category = "Motion and time"
     description = "Colours movement by when it happened (hue = time), brightness = amount of motion."
 
     def __init__(self, hue_period: int = 360):
@@ -448,84 +466,9 @@ class TemporalHueMotionProcessor(Processor):
         return _hsv_to_rgb_float(hue, value)
 
 
-_ENTROPY_KERNEL = None
-
-
-def _entropy_kernel():
-    """CUDA kernel: one histogram increment per pixel/channel. Each element owns its own
-    slice of the histogram, so no atomics (and no index arrays) are needed."""
-    global _ENTROPY_KERNEL
-    if _ENTROPY_KERNEL is None:
-        _ENTROPY_KERNEL = cp.ElementwiseKernel(
-            "float32 v, int32 bins", "raw T hist",
-            "int b = (int)floorf(v * bins); b = min(max(b, 0), bins - 1);"
-            "hist[(long long)i * bins + b] += 1;",
-            "timelapse_entropy_hist",
-        )
-    return _ENTROPY_KERNEL
-
-
-class TemporalEntropyProcessor(Processor):
-    name = "temporal_entropy"
-    description = "Shannon entropy of each pixel's values over time (GPU accelerated when CuPy is available)."
-
-    def __init__(self, hist_bins: int = 32, noise_threshold: float = 3.0, use_gpu: Optional[bool] = None):
-        self.hist_bins = int(hist_bins)
-        self.noise_threshold = normalise_threshold(noise_threshold)
-        self.gpu = HAS_CUPY if use_gpu is None else bool(use_gpu and HAS_CUPY)
-        self.xp = cp if self.gpu else np
-        self.reset()
-
-    def state_bytes(self, frame_shape):
-        # uint16 histogram (uint32 past 65535 frames) + previous frame + temporaries
-        return int(np.prod(frame_shape) * (self.hist_bins * 2 + 3 * 4))
-
-    def reset(self):
-        self.hist = None  # flat (pixels * bins), uint16 -> upgraded to uint32 if needed
-        self.prev = None
-        self.shape = None
-        self.count = 0
-
-    def _add_frame(self, frame):
-        if self.gpu:
-            _entropy_kernel()(frame.ravel(), np.int32(self.hist_bins), self.hist)
-        else:
-            bins = np.clip(np.floor(frame.ravel() * self.hist_bins), 0, self.hist_bins - 1).astype(np.int64)
-            idx = np.arange(bins.size, dtype=np.int64) * self.hist_bins + bins
-            self.hist[idx] += 1  # indices are unique within a frame, so plain += is safe
-
-    def update(self, batch):
-        xp = self.xp
-        if self.hist is None:
-            self.shape = batch.shape[1:]
-            self.hist = xp.zeros(int(np.prod(self.shape)) * self.hist_bins, dtype=xp.uint16)
-        if self.hist.dtype == xp.uint16 and self.count + batch.shape[0] > np.iinfo(np.uint16).max:
-            self.hist = self.hist.astype(xp.uint32)
-
-        data = xp.asarray(batch, dtype=xp.float32)
-        for frame in data:
-            if self.prev is not None and self.noise_threshold > 0:
-                # Ignore tiny sensor-noise changes: keep the previous value instead.
-                frame = xp.where(xp.abs(frame - self.prev) < self.noise_threshold, self.prev, frame)
-            self.prev = frame.copy()
-            self._add_frame(xp.ascontiguousarray(frame))
-            self.count += 1
-
-    def result(self):
-        xp = self.xp
-        pixels = int(np.prod(self.shape))
-        hist = self.hist.reshape(pixels, self.hist_bins)
-        entropy = xp.empty(pixels, xp.float32)
-        chunk = 4_000_000
-        for start in range(0, pixels, chunk):
-            p = hist[start:start + chunk].astype(xp.float32) / xp.float32(self.count)
-            entropy[start:start + chunk] = -(p * xp.log2(xp.maximum(p, xp.float32(1e-12)))).sum(axis=1)
-        entropy /= xp.float32(np.log2(self.hist_bins))
-        return xp.clip(entropy.reshape(self.shape), 0.0, 1.0)
-
-
 class OpticalFlowProcessor(Processor):
     name = "optical_flow_accum"
+    category = "Motion and time"
     gpu = False
     description = "Accumulated dense optical flow: hue = average direction, brightness = total movement."
 
@@ -597,6 +540,7 @@ class MotionOverlayProcessor(Processor):
     """Pass 1 builds an average background; pass 2 pastes moving objects onto it."""
 
     name = "motion_overlay"
+    category = "Motion and time"
     two_pass = True
     description = "Moving objects pasted onto a clean average background."
     state_frames = 5.0
@@ -656,15 +600,21 @@ class MotionOverlayProcessor(Processor):
         return xp.clip(self.canvas, 0.0, 1.0)
 
 
-PROCESSORS: Dict[str, Type[Processor]] = {
-    cls.name: cls
-    for cls in (
-        AverageProcessor, MaximumProcessor, MinimumProcessor, MedianProcessor, ModeProcessor,
-        TemporalContrastProcessor, TemporalStdProcessor, TemporalGradientProcessor,
-        TemporalHueMotionProcessor, TemporalEntropyProcessor, OpticalFlowProcessor,
-        MotionOverlayProcessor,
-    )
-}
+PROCESSORS: Dict[str, Type[Processor]] = {}
+
+CATEGORY_ORDER = ["Stacks", "Temporal colour", "Motion and time", "Time slice", "Clean-up and trails"]
+
+
+def register(cls: Type[Processor]) -> Type[Processor]:
+    """Add a processor class to the registry (usable as a decorator)."""
+    PROCESSORS[cls.name] = cls
+    return cls
+
+
+for _cls in (AverageProcessor, MaximumProcessor, MinimumProcessor, MedianProcessor, ModeProcessor,
+             TemporalContrastProcessor, TemporalStdProcessor, TemporalGradientProcessor,
+             TemporalHueMotionProcessor, OpticalFlowProcessor, MotionOverlayProcessor):
+    register(_cls)
 
 
 def create_processor(name: str, **params) -> Processor:
@@ -682,3 +632,6 @@ def create_processor(name: str, **params) -> Processor:
 def list_processors() -> Dict[str, str]:
     """{name: description} for every processor (useful for a GUI dropdown)."""
     return {name: cls.description for name, cls in PROCESSORS.items()}
+
+
+from . import effects as _effects  # noqa: E402,F401  (registers the entropy family, time-slice, ...)
