@@ -40,6 +40,8 @@ moving clouds and water, so new effects in that spirit are welcome.
 - `feature/effects`: v0.4. Entropy family, temporal colour maps, time-slice, deflicker, frame interpolation. Not
   merged yet: the owner is trying it out. Merge only when asked.
 - `feature/raw-sorter`: branched from `feature/effects`. The raw sorter and the app's Sort raw files tab.
+- `feature/raw-dng`: branched from `feature/raw-sorter`. Prototype that stacks raw sensor data into a DNG
+  (`rawstack.py`, CLI only). The owner is checking the output in Lightroom.
 
 ## Setup, run, test
 
@@ -49,6 +51,7 @@ python -m timelapse_engine.gui        # or double-click "Timelapse Engine.bat"
 python tests/test_engine.py           # 23 tests: engine, outputs, metadata, YUV packing
 python tests/test_effects.py          # 21 tests: each new effect does what it claims
 python tests/test_sorter.py           # 21 tests: finding sequences, move/copy/undo safety
+python tests/test_rawstack.py         # 5 tests: DNG round trip, raw stacks, clipped highlights (needs rawpy)
 python tests/test_gui.py              # headless (Qt offscreen): load, preview, queue, run; Sort tab
 ```
 
@@ -117,6 +120,23 @@ and the engine: it splits a card dump of raws into one folder per sequence.
   without re-reading the files. Previews come from the embedded `PreviewImage` / `JpgFromRaw` (about 0.4 s
   each through exiftool).
 
+**Raw stacks to DNG** (`rawstack.py`, prototype on `feature/raw-dng`).
+- **Source:** `RawSequence` is a `FrameSource` whose frames are the sensor mosaic, (H, W, 1) `uint16` in the
+  camera's own levels, so the ordinary `engine.stack()` and its processors run unchanged.
+  `stack_raw_to_dng` turns the float result back into `uint16`.
+- **Which stacks:** only per-pixel stacks are valid on a mosaic (`PHOTO_STACKS`). Anything that mixes channels
+  or neighbouring pixels is refused.
+- **Highlights:** `neutralise_clipped` sets any 2x2 block with a clipped photosite to white balanced for the
+  as-shot white. Without it, averaged glitter turned magenta: R/G went from 1.06 to 1.12 on terifa.
+- **Writer:** `write_dng` uses tifffile with photometric CFA (32803) and DNG 1.4 tags. It writes `ColorMatrix1`
+  from LibRaw's `rgb_xyz_matrix` (D65) and `AsShotNeutral` = 1 / the camera WB multipliers.
+  `UniqueCameraModel` is "Make Model" from EXIF, which Lightroom may need to offer the camera's profiles.
+  Panasonic keeps the lens name only in its maker notes, so it's copied to EXIF `LensModel`.
+- **Checked:** a 1-frame DNG reads back bit-identical to the RW2 and renders identically in LibRaw, and
+  `exiftool -validate` reports OK. Lightroom itself hasn't been checked yet.
+- **Test files:** on the laptop, `C:\Users\henry\Videos\tl_temp\terifa\dng_prototype` holds the average,
+  clipped average, keep-clipped average and a 1-frame DNG of P1195912. Compare that 1-frame DNG with the RW2.
+
 ## Adding an effect
 
 1. **Class:** in `effects.py`, add a `Processor` subclass decorated with `@register`, and set `name`,
@@ -165,6 +185,13 @@ and the engine: it splits a card dump of raws into one folder per sequence.
 - **Sorter and bracketed (HDR) timelapses:** the spacing alternates (short, short, long), so each bracket set
   looks like its own run and they end up as single shots. A fix would group the bracket sets first, then run the
   spacing test on them.
+- **The raw DNG still needs checking in Lightroom.** No `BaselineExposure` tag yet, so the brightness may differ
+  from the RW2 by a fixed amount. The Micro Four Thirds built-in distortion correction isn't carried over: Adobe
+  DNG Converter writes it as `OpcodeList3` `WarpRectilinear`. Deflicker isn't supported on raw yet; on raw it
+  would be a plain linear gain.
+- **Averages of TIFFs are gamma-space averages.** Only deflicker works in linear light, so the engine's
+  `average` of encoded TIFFs is darker in moving highlights than a real long exposure. A linear-light option
+  would fix this for the TIFF route.
 - **The sorter can't merge or split groups by hand.** You can only rename, untick, or change the tolerance and
   fewest frames.
 - **Laptop GPU:** CuPy once reported "no CUDA-capable device" while other GPU tests were running, and recovered

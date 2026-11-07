@@ -81,6 +81,42 @@ Folder names come from a pattern, by default `{date}_{time}_{interval}_{frames}f
 `2026.06.07_131442_2s_270f`). The fields are `{date}`, `{time}`, `{interval}`, `{frames}`, `{camera}` and
 `{number}`.
 
+## Raw stacks to DNG (prototype)
+
+This is an alternative to exporting every frame from Lightroom as a TIFF. The engine stacks the raw sensor
+data directly and saves one DNG, which you develop in Lightroom like any raw from the camera.
+
+```bash
+pip install -e .[raw]                                              # rawpy
+python -m timelapse_engine.rawstack "E:\TL\raw\2026.11.07_162035_0.48s_177f" --process average
+```
+
+**Why this route:**
+- **True long exposure.** Raw data is linear, so the average is what a real ND filter would record. Averaging
+  gamma-encoded TIFFs makes moving highlights too dark: on the terifa sea it was 5/255 darker overall and
+  14/255 darker in the glitter.
+- **No TIFF export.** On the terifa card, 177 frames stacked in 14 to 24 s into a 48 MB DNG, against about
+  26 GB of 16-bit TIFFs.
+- **Full latitude in the final edit.** Lightroom still does the demosaicing, colour profile, white balance and
+  highlight recovery.
+
+**How it works:**
+- `RawSequence` reads the sensor mosaic, before demosaicing, as (H, W, 1) `uint16` frames at about 25 frames/s
+  on 8 threads. The engine's normal GPU `stack()` processes them.
+- `write_dng` writes the camera's CFA layout, black and white levels, colour matrix and as-shot white balance.
+  The camera EXIF, lens name and caption come from the last frame.
+- A 1-frame DNG reads back bit-identical to the RW2 and renders identically in LibRaw.
+
+**Limits:**
+- Only per-pixel stacks work on sensor data: `average`, `maximum`, `minimum`, `median`, `clipped_average` and
+  `comet_trails`. The entropy, colour-map and motion effects need developed RGB frames.
+- Clipped highlights are made neutral white in each frame before stacking. Otherwise clipped green turns
+  averaged glitter magenta. `--keep-clipped` turns this off.
+- **Still to check in Lightroom:**
+  - Whether it offers the camera's profiles for the DNG.
+  - Its brightness against the RW2: there is no BaselineExposure tag yet.
+  - Micro Four Thirds lens correction: the built-in distortion data in the RW2 isn't carried over yet.
+
 ## Quick start
 
 ```python
@@ -121,6 +157,7 @@ See [`examples/run_pipeline.py`](examples/run_pipeline.py) for the full batch wo
 | `adjust.py` | Deflicker (brightness measurement, smoothing, linear-light gain) |
 | `interpolate.py` | Motion-compensated frame interpolation |
 | `sorter.py` | Raw sorter: groups a card dump into sequences by capture-time spacing; move/copy/undo; CLI |
+| `rawstack.py` | Prototype: stack raw sensor data (`RawSequence`) and write a DNG (`write_dng`) for Lightroom |
 | `gui/` | PySide6 desktop app (`sort_panel.py` is the Sort raw files tab) |
 
 The engine never prints or calls `input()`. Progress goes to a `progress(done, total, message)` callback, and a
