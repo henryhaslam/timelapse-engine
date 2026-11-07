@@ -242,8 +242,9 @@ def test_sort_tab():
         panel.sort("move")
         wait_until(app, lambda: not panel.busy, what="move")
         assert "Moved into 1 folder" in panel.summary_label.text(), panel.summary_label.text()
-        assert len(list((card / "first_run").glob("*.JPG"))) == 12
-        assert (card / "first_run" / "P0001003.RW2").exists()
+        assert len(list((card / "first_run" / "raw").glob("*.JPG"))) == 12
+        assert (card / "first_run" / "raw" / "P0001003.RW2").exists()
+        assert (card / "first_run" / "export").is_dir()                # ready for Lightroom's TIFF export
         assert [p.name for p in card.iterdir() if p.is_dir()] == ["first_run"]
 
         panel.undo()

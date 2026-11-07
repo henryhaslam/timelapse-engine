@@ -221,9 +221,12 @@ def test_move_and_undo():
 
             log = sorter.sort_files(result.groups, card)
             for stem, seq in expected.items():
-                where = card / names[seq] if seq is not None else card
+                where = card / names[seq] / "raw" if seq is not None else card
                 assert (where / f"{stem}.JPG").exists(), (stem, where)
-            pair = card / names[0] / "P0001003"
+            for name in names:                                         # empty export\ ready for Lightroom
+                export = card / name / "export"
+                assert export.is_dir() and not any(export.iterdir())
+            pair = card / names[0] / "raw" / "P0001003"
             for suffix in (".RW2", ".JPG", ".xmp", ".RW2.xmp"):        # the whole shot moved together
                 assert Path(f"{pair}{suffix}").exists(), suffix
             assert (card / "P1009999.MP4").exists()                   # other files left alone
@@ -232,6 +235,7 @@ def test_move_and_undo():
             restored, problems = sorter.undo(log)
             assert problems == [] and restored == 12 + 9 + 2 * 3
             assert tree(card) == sorted(before + [log.name])          # back as it was, plus the log
+            assert not [p for p in card.iterdir() if p.is_dir()]      # sequence, raw\ and export\ folders gone
             assert json.loads(log.read_text())["undone"]
             assert sorter.find_last_log(card) is None
         finally:
@@ -251,7 +255,7 @@ def test_name_clash_across_card_folders_keeps_pairs():
         result = sorter.analyse(card, subfolders=True, use_exiftool=False)
         assert [g.frames for g in result.groups] == [10]
         sorter.sort_files(result.groups, tmp / "sorted")
-        out = tmp / "sorted" / result.groups[0].name
+        out = tmp / "sorted" / result.groups[0].name / "raw"
         assert len(list(out.glob("*.JPG"))) == 10
         for i in range(5):
             stem = f"P100{i:04d}"
@@ -267,8 +271,8 @@ def test_never_overwrites():
         for i, off in enumerate(run(0, 2, 6)):
             write_jpeg(tmp / f"IMG_{i:04d}.JPG", T0 + timedelta(seconds=off))
         result = sorter.analyse(tmp, use_exiftool=False)
-        folder = tmp / result.groups[0].name
-        folder.mkdir()
+        folder = tmp / result.groups[0].name / "raw"
+        folder.mkdir(parents=True)
         (folder / "IMG_0002.JPG").write_bytes(b"someone else's file")
         sorter.sort_files(result.groups, tmp)
         assert (folder / "IMG_0002.JPG").read_bytes() == b"someone else's file"
@@ -278,6 +282,26 @@ def test_never_overwrites():
             raise AssertionError("overwrote a file")
         except FileExistsError:
             pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_flat_layout_and_single_shots():
+    """subfolders=False puts files straight into each sequence folder; single shots are
+    always flat (no raw\\ or export\\), whatever the layout."""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        for layout in (False, True):
+            card = tmp / f"card_{layout}"
+            make_card(card)
+            result = sorter.analyse(card, use_exiftool=False)
+            sorter.sort_files(list(result.groups) + [result.singles], card, subfolders=layout)
+            first = card / result.groups[0].name
+            assert len(list((first / "raw" if layout else first).glob("*.JPG"))) == 12
+            assert (first / "export").is_dir() == layout
+            singles = card / sorter.SINGLES_NAME
+            assert len(list(singles.glob("*.JPG"))) == 2
+            assert not (singles / "raw").exists() and not (singles / "export").exists()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

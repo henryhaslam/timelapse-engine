@@ -63,6 +63,18 @@ records it) and looks at the spacing between shots:
 4. Rename folders in the table (double-click) or untick any you want left where they are.
 5. **Move into folders** (instant on the same drive) or **Copy into folders**.
 
+**Folder layout.** Each sequence gets its files in `raw\` and an empty `export\` beside it:
+
+```
+2026.11.07_162035_0.48s_177f\
+    raw\       P1195824.RW2 ... P1196000.RW2   <- import into Lightroom
+    export\                                    <- export the 16-bit TIFFs here
+```
+
+You can then work through the folders one by one in Lightroom. When you load `...\export` in the engine, outputs
+are named after the sequence folder and saved in it. Untick **raw\ + export\ subfolders** (or use `--flat`) to put
+the files straight into each folder. Single shots always go straight into `singles\`.
+
 **Safety:** nothing is ever overwritten. If a name is taken (e.g. two card folders both have `P1000001.RW2`),
 every file of that shot gets the same `_2` suffix, so the raw and its sidecar stay paired. Each sort writes a log
 (`_timelapse-sort-<date>.json`) next to the new folders, even if it stops part way, and **Undo last sort** uses it

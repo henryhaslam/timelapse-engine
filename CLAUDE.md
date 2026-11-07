@@ -36,10 +36,12 @@ moving clouds and water, so new effects in that spirit are welcome.
 
 ## Branches
 
-- `main`: v0.3. GUI with frame-range timeline, output metadata.
-- `feature/effects`: v0.4. Entropy family, temporal colour maps, time-slice, deflicker, frame interpolation. Not
-  merged yet: the owner is trying it out. Merge only when asked.
-- `feature/raw-sorter`: branched from `feature/effects`. The raw sorter and the app's Sort raw files tab.
+- `main`: v0.4 plus the raw sorter. Merged on 2026-11-07: `feature/effects` (entropy family, temporal colour
+  maps, time-slice, deflicker, frame interpolation) and `feature/raw-sorter` (the Sort raw files tab).
+- `feature/raw-dng`: parked prototype that stacks raw sensor data into a DNG (`rawstack.py`). Lightroom
+  refused the DNG ("does not contain a supported format"). The owner dropped the idea because the entropy
+  effects can't use raw mosaics. Leave it as is unless asked.
+- `feature/effects`, `feature/raw-sorter` and `feature/gui` are merged; new work branches from `main`.
 
 ## Setup, run, test
 
@@ -48,7 +50,7 @@ pip install -e ".[gpu,gui]"          # gpu = cupy-cuda12x; leave it out on a mac
 python -m timelapse_engine.gui        # or double-click "Timelapse Engine.bat"
 python tests/test_engine.py           # 23 tests: engine, outputs, metadata, YUV packing
 python tests/test_effects.py          # 21 tests: each new effect does what it claims
-python tests/test_sorter.py           # 21 tests: finding sequences, move/copy/undo safety
+python tests/test_sorter.py           # 22 tests: finding sequences, move/copy/undo safety, folder layout
 python tests/test_gui.py              # headless (Qt offscreen): load, preview, queue, run; Sort tab
 ```
 
@@ -113,6 +115,11 @@ and the engine: it splits a card dump of raws into one folder per sequence.
   `find_sequences` turns runs of at least `min_frames` shots into `Group`s; everything else is single shots.
 - **Move:** `plan_moves` never overwrites; on a name clash every file of the shot gets the same `_2`.
   `sort_files` logs each move as it goes, in a `try/finally`, so a cancelled or failed sort can still be undone.
+- **Layout:** files go to `<sequence>\raw` with an empty `<sequence>\export` beside it. That's the owner's
+  workflow: import the raw folder into Lightroom, export TIFFs into export, and load export in the engine, which
+  names outputs after `<sequence>`. `_make_dirs` logs every folder it creates, so undo removes them, but only
+  while they're empty. Single shots are always flat. `subfolders=False` (`--flat`, or the GUI checkbox) puts
+  the files straight into each folder.
 - **GUI:** tolerance, fewest-frames and counter changes call `find_sequences` again on the shots already read,
   without re-reading the files. Previews come from the embedded `PreviewImage` / `JpgFromRaw` (about 0.4 s
   each through exiftool).
@@ -167,5 +174,8 @@ and the engine: it splits a card dump of raws into one folder per sequence.
   spacing test on them.
 - **The sorter can't merge or split groups by hand.** You can only rename, untick, or change the tolerance and
   fewest frames.
+- **Averages of TIFFs are gamma-space averages.** Only deflicker works in linear light, so `average` of encoded
+  TIFFs is darker in moving highlights than a real long exposure. On terifa it was 5/255 darker overall and
+  14/255 darker in the sea glitter. An optional linear-light average would fix this.
 - **Laptop GPU:** CuPy once reported "no CUDA-capable device" while other GPU tests were running, and recovered
   afterwards. The app checks for the GPU once at start-up, so restart it if the status bar says CPU mode.

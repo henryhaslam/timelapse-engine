@@ -218,6 +218,13 @@ class SortPanel(QWidget):
         self.template_edit.editingFinished.connect(self._apply_template)
         names.addWidget(self.template_edit, 1)
         names.addSpacing(12)
+        self.layout_check = QCheckBox("raw\\ + export\\ subfolders")
+        self.layout_check.setChecked(True)
+        self.layout_check.setToolTip("Put each sequence's files in <folder>\\raw and make an empty <folder>\\export "
+                                     "beside it for Lightroom's TIFF export.\nUntick to put the files straight "
+                                     "into each folder. Single shots always go straight into their folder.")
+        names.addWidget(self.layout_check)
+        names.addSpacing(12)
         names.addWidget(QLabel("Put folders in"))
         self.dest_picker = PathPicker("the raw folder itself")
         self.dest_picker.setToolTip("Leave empty to create the sequence folders inside the raw folder.")
@@ -313,7 +320,8 @@ class SortPanel(QWidget):
         self.cancel_btn.setVisible(busy)
         self.progress_bar.setRange(0, 0)
         for w in (self.folder_picker, self.subfolders_check, self.analyse_btn, self.tolerance_spin,
-                  self.min_frames_spin, self.counter_check, self.template_edit, self.dest_picker, self.table):
+                  self.min_frames_spin, self.counter_check, self.template_edit, self.layout_check, self.dest_picker,
+                  self.table):
             w.setEnabled(not busy)
         if message:
             self.summary_label.setText(message)
@@ -518,19 +526,22 @@ class SortPanel(QWidget):
             return
         dest = self.dest_root()
         files = [f for g in groups for f in g.files]
+        subfolders = self.layout_check.isChecked()
         if self.confirm:
             size = sum(os.path.getsize(f) for f in files if os.path.exists(f))
             verb = "Move" if mode == "move" else "Copy"
+            layout = (f"Each folder gets the files in {sorter.RAW_SUBFOLDER}\\ and an empty "
+                      f"{sorter.EXPORT_SUBFOLDER}\\ for Lightroom.\n\n" if subfolders else "")
             answer = QMessageBox.question(
                 self, f"{verb} files",
                 f"{verb} {len(files)} files ({size / 1e9:.1f} GB) into {len(groups)} folder"
-                f"{'s' if len(groups) != 1 else ''} in\n{dest}?\n\nNothing is overwritten, and a log is written "
-                f"so 'Undo last sort' can put everything back.")
+                f"{'s' if len(groups) != 1 else ''} in\n{dest}?\n\n{layout}Nothing is overwritten, and a log is "
+                f"written so 'Undo last sort' can put everything back.")
             if answer != QMessageBox.Yes:
                 return
         self._cancel = CancelToken()
         self._set_busy(True, f"{'Moving' if mode == 'move' else 'Copying'} {len(files)} files…")
-        self.tasks.submit(sorter.sort_files, groups, dest, mode, self._report, self._cancel,
+        self.tasks.submit(sorter.sort_files, groups, dest, mode, self._report, self._cancel, subfolders,
                           on_done=lambda log, m=mode, n=len(groups): self._on_sorted(log, m, n),
                           on_failed=self._on_sort_failed)
         self._watch_cancel("Cancelled. Files already moved are in the log; 'Undo last sort' puts them back.")
@@ -595,6 +606,7 @@ class SortPanel(QWidget):
         self.min_frames_spin.setValue(int(s.value("sort/min_frames", 5)))
         self.counter_check.setChecked(s.value("sort/counter", "true") == "true")
         self.template_edit.setText(s.value("sort/template", sorter.DEFAULT_TEMPLATE))
+        self.layout_check.setChecked(s.value("sort/raw_export", "true") == "true")
         self.dest_picker.set_path(s.value("sort/dest", ""))
         for key, splitter in (("sort/top_splitter", self._top_splitter), ("sort/body_splitter", self._body_splitter)):
             state = s.value(key)
@@ -610,6 +622,7 @@ class SortPanel(QWidget):
         s.setValue("sort/min_frames", self.min_frames_spin.value())
         s.setValue("sort/counter", "true" if self.counter_check.isChecked() else "false")
         s.setValue("sort/template", self._template())
+        s.setValue("sort/raw_export", "true" if self.layout_check.isChecked() else "false")
         s.setValue("sort/dest", self.dest_picker.path())
         s.setValue("sort/top_splitter", self._top_splitter.saveState())
         s.setValue("sort/body_splitter", self._body_splitter.saveState())

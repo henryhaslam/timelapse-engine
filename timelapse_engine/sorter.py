@@ -20,6 +20,11 @@ How sequences are found (:func:`find_sequences`):
   whose gap happens to look like the spacing.
 * Shots in no sequence are "single shots" and stay where they are unless asked.
 
+Each sequence folder gets the files in ``raw\`` and an empty ``export\`` beside it, ready
+for Lightroom's TIFF export, which the engine then reads (``<sequence>\export`` is named
+after ``<sequence>``). Pass ``subfolders=False`` (CLI ``--flat``) to put the files straight
+into the sequence folder. Single shots always go straight into their folder.
+
 Files that share a name (``P1000123.RW2`` + ``P1000123.JPG`` + ``P1000123.xmp``) are one
 shot and always move together. Nothing is ever overwritten, and every sort writes a log
 next to the new folders that :func:`undo` uses to put the files back.
@@ -61,6 +66,8 @@ SIDECAR_EXTENSIONS = frozenset({".xmp", ".pp3", ".dop", ".thm", ".on1"})
 DEFAULT_TEMPLATE = "{date}_{time}_{interval}_{frames}f"
 TEMPLATE_FIELDS = ("date", "time", "interval", "frames", "camera", "number")
 SINGLES_NAME = "singles"
+RAW_SUBFOLDER = "raw"          # <sequence>\raw holds the sorted files
+EXPORT_SUBFOLDER = "export"    # <sequence>\export is left empty for Lightroom's TIFF export
 LOG_PREFIX = "_timelapse-sort-"
 
 # Timestamp slack: EXIF times without sub-seconds are truncated to the second, so two
@@ -538,18 +545,23 @@ def _renamed(name: str, stem: str, k: int) -> str:
     return f"{p.stem}_{k}{p.suffix}"
 
 
-def plan_moves(groups: Sequence[Group], dest_root) -> List[Move]:
-    """Where each file goes: ``dest_root/<group name>/<file name>``.
+def group_folder(g: Group, dest_root, subfolders: bool = True) -> Path:
+    """Where a group's files go: ``<dest>/<name>/raw`` (or ``<dest>/<name>`` when flat or single shots)."""
+    folder = Path(dest_root) / g.name
+    return folder / RAW_SUBFOLDER if subfolders and not g.singles else folder
+
+
+def plan_moves(groups: Sequence[Group], dest_root, subfolders: bool = True) -> List[Move]:
+    """Where each file goes: ``dest_root/<group name>/raw/<file name>`` (see :func:`group_folder`).
 
     Files already in place are skipped. When a name is taken (two card folders both
     holding P1000001.RW2, or a file already at the destination), all files of that shot
     get the same ``_2`` suffix so raw, JPEG and sidecar stay paired. Nothing is overwritten.
     """
-    dest_root = Path(dest_root)
     taken = set()
     moves: List[Move] = []
     for g in groups:
-        folder = dest_root / g.name
+        folder = group_folder(g, dest_root, subfolders)
         for shot in g.shots:
             k = 1
             while True:
@@ -591,6 +603,18 @@ def _copy_file(src: str, dst: str) -> None:
     os.rename(partial, dst)
 
 
+def _make_dirs(path: Path, created: List[str]) -> None:
+    """mkdir -p that records every folder it creates (parents first), so undo can remove them."""
+    missing = []
+    p = Path(path)
+    while not p.exists():
+        missing.append(p)
+        p = p.parent
+    for d in reversed(missing):
+        d.mkdir()
+        created.append(str(d))
+
+
 def _write_log(path: Path, log: dict) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(log, indent=1), encoding="utf-8")
@@ -598,17 +622,19 @@ def _write_log(path: Path, log: dict) -> None:
 
 
 def sort_files(groups: Sequence[Group], dest_root, mode: str = "move", progress: Optional[ProgressCallback] = None,
-               cancel: Optional[CancelToken] = None) -> Path:
-    """Move or copy each group into ``dest_root/<group.name>``. Returns the log path.
+               cancel: Optional[CancelToken] = None, subfolders: bool = True) -> Path:
+    """Move or copy each group into ``dest_root/<group.name>/raw``, and make an empty
+    ``dest_root/<group.name>/export`` beside it (``subfolders=False``: straight into
+    ``dest_root/<group.name>``, no export folder). Returns the log path.
 
-    The log lists every file that was moved or copied, even when the sort stops part way
-    (an error or a cancel), so :func:`undo` can always put things back.
+    The log lists every file that was moved or copied and every folder created, even when
+    the sort stops part way (an error or a cancel), so :func:`undo` can always put things back.
     """
     if mode not in ("move", "copy"):
         raise ValueError("mode must be 'move' or 'copy'")
     dest_root = Path(dest_root)
     dest_root.mkdir(parents=True, exist_ok=True)
-    moves = plan_moves(groups, dest_root)
+    moves = plan_moves(groups, dest_root, subfolders)
     if mode == "copy":
         need = sum(os.path.getsize(m.src) for m in moves)
         free = shutil.disk_usage(dest_root).free
@@ -624,12 +650,13 @@ def sort_files(groups: Sequence[Group], dest_root, mode: str = "move", progress:
     action = _move_file if mode == "move" else _copy_file
     report(progress, 0, len(moves), f"{verb} files")
     try:
+        if subfolders:
+            for g in groups:
+                if not g.singles:
+                    _make_dirs(dest_root / g.name / EXPORT_SUBFOLDER, log["folders"])
         for i, m in enumerate(moves, 1):
             check_cancel(cancel)
-            parent = Path(m.dst).parent
-            if not parent.is_dir():
-                parent.mkdir(parents=True)
-                log["folders"].append(str(parent))
+            _make_dirs(Path(m.dst).parent, log["folders"])
             action(m.src, m.dst)
             log["moves"].append([m.src, m.dst])
             if i % 200 == 0:
@@ -747,7 +774,7 @@ def preview_image(path, max_side: int = 900, exiftool_path: Optional[str] = None
 # Command line
 # ---------------------------------------------------------------------------
 
-def _print_plan(result: Analysis, dest_root: Path, include_singles: bool) -> None:
+def _print_plan(result: Analysis, dest_root: Path, include_singles: bool, subfolders: bool = True) -> None:
     print(f"\n{result.summary()}\n")
     width = max([len(g.name) for g in result.groups] + [len(SINGLES_NAME), 6])
     for g in result.groups:
@@ -757,7 +784,9 @@ def _print_plan(result: Analysis, dest_root: Path, include_singles: bool) -> Non
     if result.singles.frames:
         where = f"-> {SINGLES_NAME}" if include_singles else "(left where they are)"
         print(f"  {'':<{width}}  {result.singles.frames:5d} single shots {where}")
-    print(f"\nFolders go in {dest_root}")
+    layout = (f"each with the files in {RAW_SUBFOLDER}\\ and an empty {EXPORT_SUBFOLDER}\\ for Lightroom"
+              if subfolders else "files straight into each folder")
+    print(f"\nFolders go in {dest_root} ({layout})")
 
 
 def main(argv=None) -> int:
@@ -777,6 +806,9 @@ def main(argv=None) -> int:
                          f"{', '.join('{' + f + '}' for f in TEMPLATE_FIELDS)})")
     ap.add_argument("--dest", help="put the sequence folders here instead of inside FOLDER")
     ap.add_argument("--singles", action="store_true", help=f"also move single shots into '{SINGLES_NAME}'")
+    ap.add_argument("--flat", action="store_true",
+                    help=f"put files straight into each sequence folder (no {RAW_SUBFOLDER}\\ and "
+                         f"{EXPORT_SUBFOLDER}\\ subfolders)")
     act = ap.add_mutually_exclusive_group()
     act.add_argument("--move", action="store_true", help="move the files into the folders")
     act.add_argument("--copy", action="store_true", help="copy the files, leaving the originals")
@@ -800,11 +832,12 @@ def main(argv=None) -> int:
                      min_frames=args.min_frames, use_counter=not args.no_counter, template=args.names,
                      progress=ConsoleProgress())
     groups = list(result.groups) + ([result.singles] if args.singles and result.singles.frames else [])
-    _print_plan(result, dest_root, args.singles)
+    _print_plan(result, dest_root, args.singles, not args.flat)
     if not (args.move or args.copy):
         print("Nothing moved. Add --move or --copy to sort the files.")
         return 0
-    log_path = sort_files(groups, dest_root, mode="move" if args.move else "copy", progress=ConsoleProgress())
+    log_path = sort_files(groups, dest_root, mode="move" if args.move else "copy", progress=ConsoleProgress(),
+                          subfolders=not args.flat)
     dest_arg = f' --dest "{dest_root}"' if args.dest else ""
     print(f"Done (log: {log_path.name}). To put everything back:\n"
           f'  python -m timelapse_engine.sorter "{args.folder}" --undo{dest_arg}')
