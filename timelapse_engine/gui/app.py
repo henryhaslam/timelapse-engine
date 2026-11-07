@@ -30,6 +30,7 @@ from ..jobs import (KINDS, MASTERS, Job, SourceCache, default_export, is_video, 
                     save_queue)
 from ..processors import CATEGORY_ORDER, PROCESSORS
 from ..progress import CancelToken, logger
+from .sort_panel import SortPanel
 from .widgets import ImageView, ParamForm, PathPicker, Timeline
 from .worker import QtLogHandler, QueueRunner, TaskRunner
 
@@ -61,6 +62,8 @@ DISPLAY_NAMES = {
 VIDEO_FILTER = "Video files (*.mp4 *.mov *.mkv *.avi *.m4v *.mts *.mxf);;All files (*)"
 PREVIEW_SIZES = {"Fast (960 px)": 960, "Normal (1280 px)": 1280, "Large (1920 px)": 1920}
 DISPLAY_MAX_SIDE = 1920
+
+TAB_SORT, TAB_ENGINE = 0, 1
 
 STATUS_WAITING, STATUS_RUNNING, STATUS_DONE = "Waiting", "Running", "Done"
 STATUS_FAILED, STATUS_CANCELLED = "Failed", "Cancelled"
@@ -131,7 +134,14 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([400, 1100])
         self._main_splitter = splitter
-        self.setCentralWidget(splitter)
+        # Two steps: sort the raw card dump into sequences, then (after Lightroom) stack and render.
+        self.sort_panel = SortPanel(self.settings)
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setDocumentMode(True)
+        self.main_tabs.addTab(self.sort_panel, "Sort raw files")
+        self.main_tabs.addTab(splitter, "Stack and render")
+        self.main_tabs.setCurrentIndex(TAB_ENGINE)
+        self.setCentralWidget(self.main_tabs)
 
         self._gpu_label = QLabel()
         self.statusBar().addPermanentWidget(self._gpu_label)
@@ -962,6 +972,7 @@ class MainWindow(QMainWindow):
             if isinstance(state, QByteArray):
                 splitter.restoreState(state)
         self.auto_preview.setChecked(self.settings.value("auto_preview", "true") == "true")
+        self.main_tabs.setCurrentIndex(int(self.settings.value("main_tab", TAB_ENGINE)))
         self.source_picker.start_dir = self.settings.value("last_source_dir", "")
         self.param_form.set_processor(self.process_combo.currentData())
         self.process_desc.setText(PROCESSORS[self.process_combo.currentData()].description)
@@ -984,6 +995,16 @@ class MainWindow(QMainWindow):
             self._queue_runner.stop()
             self._queue_thread.quit()
             self._queue_thread.wait(30000)
+        if self.sort_panel.busy:
+            answer = QMessageBox.question(self, "Sorting files",
+                                          "Files are still being sorted. Stop and quit? Files already moved "
+                                          "stay in the log, so 'Undo last sort' can still put them back.")
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+        self.sort_panel.shutdown()
+        self.sort_panel.save_settings()
+        self.settings.setValue("main_tab", self.main_tabs.currentIndex())
         if self._preview_cancel is not None:
             self._preview_cancel.cancel()
         self.tasks.wait(10000)

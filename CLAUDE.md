@@ -18,9 +18,9 @@ moving clouds and water, so new effects in that spirit are welcome.
 
 | | Desktop | Laptop |
 |---|---|---|
-| Hardware | Ryzen 7 7700X, RTX 3080 Ti 12 GB, 64 GB RAM | RTX 4070 laptop GPU (usually 8 GB), 32 GB RAM |
-| Repo | `C:\Users\Henry\OneDrive\Python\timelapse-engine` | clone **outside OneDrive** (e.g. `C:\dev\timelapse-engine`) |
-| Real footage | `C:\Users\Henry\Videos\TL_temp\...`, e.g. `copenhagen\2026.06.07_copenhill\export_tiff` (16-bit ProPhoto TIFF, 312 frames) | none by default; copy a short stretch over for testing |
+| Hardware | Ryzen 7 7700X, RTX 3080 Ti 12 GB, 64 GB RAM | Ryzen AI 9 HX 370, RTX 4070 laptop GPU (8 GB), 32 GB RAM |
+| Repo | `C:\Users\Henry\OneDrive\Python\timelapse-engine` (to move to `C:\dev` too) | `C:\dev\timelapse-engine`, with exiftool in `C:\dev\exiftool-13.59_32` |
+| Real footage | `C:\Users\Henry\Videos\TL_temp\...`, e.g. `copenhagen\2026.06.07_copenhill\export_tiff` (16-bit ProPhoto TIFF, 312 frames) | `C:\Users\henry\Videos\tl_temp\terifa\raw`: 638 G9 II RW2 raws, 6 sequences (sorter test card) |
 
 - Code moves between machines through GitHub (`henryhaslam/timelapse-engine`), never through OneDrive. Two
   machines editing the same synced git folder can corrupt it.
@@ -28,6 +28,9 @@ moving clouds and water, so new effects in that spirit are welcome.
 - **Ask before every push.** Approval covers one push only.
 - On the desktop, `git` and `gh` are not on `PATH`. Use `"/c/Program Files/Git/cmd/git.exe"` and
   `"/c/Program Files/GitHub CLI/gh.exe"`.
+- On the laptop, Git (installed with winget) is on `PATH` and signed in through Git Credential Manager; there is
+  no `gh`. Python is 3.14 from the Python install manager. If `python` opens the Microsoft Store, use `py`, or the
+  full path `%LOCALAPPDATA%\Python\bin\python.exe`.
 - The laptop has 8 GB of VRAM, so check heavy effects there with `benchmarks/memory_bench.py`. `clipped_average`
   and `rhythm_map` reached about 7.7 GB at 20 MP on the desktop.
 
@@ -36,6 +39,7 @@ moving clouds and water, so new effects in that spirit are welcome.
 - `main`: v0.3. GUI with frame-range timeline, output metadata.
 - `feature/effects`: v0.4. Entropy family, temporal colour maps, time-slice, deflicker, frame interpolation. Not
   merged yet: the owner is trying it out. Merge only when asked.
+- `feature/raw-sorter`: branched from `feature/effects`. The raw sorter and the app's Sort raw files tab.
 
 ## Setup, run, test
 
@@ -44,7 +48,8 @@ pip install -e ".[gpu,gui]"          # gpu = cupy-cuda12x; leave it out on a mac
 python -m timelapse_engine.gui        # or double-click "Timelapse Engine.bat"
 python tests/test_engine.py           # 23 tests: engine, outputs, metadata, YUV packing
 python tests/test_effects.py          # 21 tests: each new effect does what it claims
-python tests/test_gui.py              # headless (Qt offscreen): load, preview, queue, run
+python tests/test_sorter.py           # 21 tests: finding sequences, move/copy/undo safety
+python tests/test_gui.py              # headless (Qt offscreen): load, preview, queue, run; Sort tab
 ```
 
 - **pytest:** not installed on the desktop, so the test files run themselves. `pytest` also works where it is
@@ -96,6 +101,22 @@ Interpolation writes the in-between frames to the sinks.
   `jobs.processor_params`.
 - Long work runs on QThreads (`gui/worker.py`). Settings are saved in `%APPDATA%\timelapse-engine\gui.ini`.
 
+**Raw sorter** (`sorter.py`, GUI `gui/sort_panel.py`, CLI `timelapse-sort`). This is the step before Lightroom
+and the engine: it splits a card dump of raws into one folder per sequence.
+- **Scan:** `collect_shots` groups same-name files into a `Shot` (raw preferred as the main file; JPEG and
+  `.xmp` / `.RW2.xmp` sidecars are companions). `read_shot_times` runs exiftool (`-fast`) in up to 4 parallel
+  processes, with chunks passed in UTF-8 argfiles. It reads `SubSecDateTimeOriginal`, camera and serial, and
+  `SequenceNumber`. Fallbacks: Pillow for JPEG/TIFF, then the file modified time.
+- **Find sequences:** `spacing_runs` works on one camera at a time. A run continues while each gap is within
+  `tolerance` (default 25 %) of the median of the last 5 gaps. The slack is 0.1 s with sub-seconds, 1 s
+  without. A shot counter that restarts also cuts, but only for cameras whose counter really counts up.
+  `find_sequences` turns runs of at least `min_frames` shots into `Group`s; everything else is single shots.
+- **Move:** `plan_moves` never overwrites; on a name clash every file of the shot gets the same `_2`.
+  `sort_files` logs each move as it goes, in a `try/finally`, so a cancelled or failed sort can still be undone.
+- **GUI:** tolerance, fewest-frames and counter changes call `find_sequences` again on the shots already read,
+  without re-reading the files. Previews come from the embedded `PreviewImage` / `JpgFromRaw` (about 0.4 s
+  each through exiftool).
+
 ## Adding an effect
 
 1. **Class:** in `effects.py`, add a `Processor` subclass decorated with `@register`, and set `name`,
@@ -125,6 +146,9 @@ Interpolation writes the in-between frames to the sinks.
   small tolerance.
 - **Spelling:** British throughout (colour, stabilise, neighbourhood). Keep it consistent, including setting
   names.
+- **The sorter handles the owner's original raws.** Never overwrite or delete them. Every file operation goes
+  through the log, so Undo always works. Try new sorting logic with a dry run (no `--move`) on real cards before
+  moving anything.
 
 ## Known issues and next ideas
 
@@ -138,3 +162,10 @@ Interpolation writes the in-between frames to the sinks.
   them.
 - **Measured flicker:** the G10 sequence has about 2.5% frame-to-frame flicker, the Copenhill one 0.18%.
 - **ProRes masters** are limited by the CPU encoder (2.7-7.6 fps at 20 MP). `master="hevc_nvenc"` is 3-7x faster.
+- **Sorter and bracketed (HDR) timelapses:** the spacing alternates (short, short, long), so each bracket set
+  looks like its own run and they end up as single shots. A fix would group the bracket sets first, then run the
+  spacing test on them.
+- **The sorter can't merge or split groups by hand.** You can only rename, untick, or change the tolerance and
+  fewest frames.
+- **Laptop GPU:** CuPy once reported "no CUDA-capable device" while other GPU tests were running, and recovered
+  afterwards. The app checks for the GPU once at start-up, so restart it if the status bar says CPU mode.

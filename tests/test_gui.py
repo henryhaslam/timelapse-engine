@@ -192,6 +192,70 @@ def test_gui_end_to_end(screenshot: str = None):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_sort_tab():
+    """Sort tab: analyse a card folder, regroup, rename/untick in the table, move, undo."""
+    if QApplication is None:
+        print("  (PySide6 not installed, skipping)")
+        return
+    from timelapse_engine.gui.app import TAB_SORT, MainWindow, apply_dark_theme
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_sorter import make_card, tree
+
+    tmp = Path(tempfile.mkdtemp())
+    QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp / "settings"))
+    app = QApplication.instance() or QApplication([])
+    apply_dark_theme(app)
+    win = MainWindow()
+    win.resize(1500, 950)
+    win.show()
+    try:
+        card = tmp / "card"
+        make_card(card)
+        before = tree(card)
+        win.main_tabs.setCurrentIndex(TAB_SORT)
+        panel = win.sort_panel
+        panel.confirm = False
+        panel.folder_picker.set_path(str(card), emit=True)          # picking a folder analyses it
+        wait_until(app, lambda: panel.analysis is not None and not panel.busy, what="analysis")
+        assert [g.frames for g in panel.analysis.groups] == [12, 9]
+        assert panel.table.rowCount() == 3                             # two sequences + single shots
+        assert panel.table.item(0, 0).checkState() == Qt.Checked
+        assert panel.table.item(2, 0).checkState() == Qt.Unchecked    # single shots stay by default
+        assert panel.summary_label.text().startswith("2 sequences (21 shots), 2 single shots")
+        assert panel.table.item(1, 4).text() == "every 0.5s"
+        wait_until(app, lambda: not panel.first_view._item.pixmap().isNull(), what="first-frame preview")
+
+        # Settings regroup the shots already read: 10 fewest frames makes the 9-frame run single shots
+        panel.min_frames_spin.setValue(10)
+        panel.regroup()
+        assert [g.frames for g in panel.analysis.groups] == [12] and panel.analysis.singles.frames == 11
+        panel.min_frames_spin.setValue(5)
+        panel.regroup()
+        panel._regroup_timer.stop()
+        assert [g.frames for g in panel.analysis.groups] == [12, 9]
+
+        # Rename the first folder in the table, untick the second, move
+        panel.table.item(0, 0).setText("first_run")
+        panel.table.item(1, 0).setCheckState(Qt.Unchecked)
+        assert panel.move_btn.isEnabled()
+        panel.sort("move")
+        wait_until(app, lambda: not panel.busy, what="move")
+        assert "Moved into 1 folder" in panel.summary_label.text(), panel.summary_label.text()
+        assert len(list((card / "first_run").glob("*.JPG"))) == 12
+        assert (card / "first_run" / "P0001003.RW2").exists()
+        assert [p.name for p in card.iterdir() if p.is_dir()] == ["first_run"]
+
+        panel.undo()
+        wait_until(app, lambda: not panel.busy, what="undo")
+        assert "put back" in panel.summary_label.text(), panel.summary_label.text()
+        assert tree(card) == sorted(before + [Path(panel.last_log).name])
+    finally:
+        win.close()
+        app.processEvents()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_job_validation():
     errors = Job().validate()
     assert any("image folder or video" in e for e in errors) and any("output folder" in e for e in errors)

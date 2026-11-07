@@ -20,6 +20,7 @@ is read with Pillow.
 ## Desktop app
 
 Double-click **`Timelapse Engine.bat`**, or run `python -m timelapse_engine.gui` (`timelapse-gui` once installed).
+The app has two tabs: **Sort raw files** (below) and **Stack and render**.
 
 - **Source:** pick an image folder or a video. Frames are sorted by capture time and checked once, and you can
   limit the job to a frame range. The scrubber steps through frames, showing each file name and capture time.
@@ -34,6 +35,51 @@ Double-click **`Timelapse Engine.bat`**, or run `python -m timelapse_engine.gui`
   script with `run_job`.
 - **Other details:** the log tab shows engine messages, and the status bar shows free GPU memory. Window layout
   and your last settings are remembered in `%APPDATA%\timelapse-engine\gui.ini`.
+
+## Sorting raw files into sequences
+
+A card dump is one long list of shots. The **Sort raw files** tab (or `timelapse-sort`) splits it into one folder
+per timelapse sequence before you import into Lightroom.
+
+**How it groups shots.** It reads every shot's capture time (with exiftool, to the millisecond where the camera
+records it) and looks at the spacing between shots:
+
+- A run of evenly spaced shots is one sequence. The spacing is compared with the recent spacing, so a slowly
+  ramped interval (day to night) stays together.
+- A gap that doesn't fit the spacing ends the sequence. The next one can have the same spacing or a new one.
+- Where the camera numbers the shots of each burst or interval run (Panasonic `SequenceNumber`), a restart of
+  that counter also ends the sequence.
+- Each camera body is grouped separately. Shots in no sequence are single shots and stay where they are unless
+  you tick them.
+- Files that share a name (`P1000123.RW2`, `.JPG`, `.xmp`, `.RW2.xmp`) are one shot and always move together.
+
+**In the app:**
+1. Pick the folder and the table fills in with one row per sequence. Each row shows the start time, length,
+   frame count, spacing, camera and file range.
+2. Select a row to see its first and last frame. The chart underneath plots the spacing of every shot (log
+   scale): flat coloured lines are sequences, grey dots are the gaps between them.
+3. If the grouping looks wrong, adjust **Spacing tolerance** (default 25 %) or **Fewest frames** (default 5).
+   The table regroups instantly without re-reading the files.
+4. Rename folders in the table (double-click) or untick any you want left where they are.
+5. **Move into folders** (instant on the same drive) or **Copy into folders**.
+
+**Safety:** nothing is ever overwritten. If a name is taken (e.g. two card folders both have `P1000001.RW2`),
+every file of that shot gets the same `_2` suffix, so the raw and its sidecar stay paired. Each sort writes a log
+(`_timelapse-sort-<date>.json`) next to the new folders, even if it stops part way, and **Undo last sort** uses it
+to put everything back.
+
+On the G9 II sample card (638 RW2 files, 25 GB), it found all six sequences in about 5 s: a 10 fps burst, two
+0.48 s runs 17 s apart, and three 1 s runs, including a 7-frame false start.
+
+```bash
+timelapse-sort "E:\card\DCIM" --subfolders           # show what it would do
+timelapse-sort "E:\card\DCIM" --subfolders --move    # do it (or --copy, --dest D:\TL)
+timelapse-sort "E:\card\DCIM" --undo                 # put everything back
+```
+
+Folder names come from a pattern, by default `{date}_{time}_{interval}_{frames}f` (e.g.
+`2026.06.07_131442_2s_270f`). The fields are `{date}`, `{time}`, `{interval}`, `{frames}`, `{camera}` and
+`{number}`.
 
 ## Quick start
 
@@ -74,7 +120,8 @@ See [`examples/run_pipeline.py`](examples/run_pipeline.py) for the full batch wo
 | `effects.py` | Entropy family, temporal colour maps, time-slice, clean-up and trail effects |
 | `adjust.py` | Deflicker (brightness measurement, smoothing, linear-light gain) |
 | `interpolate.py` | Motion-compensated frame interpolation |
-| `gui/` | PySide6 desktop app |
+| `sorter.py` | Raw sorter: groups a card dump into sequences by capture-time spacing; move/copy/undo; CLI |
+| `gui/` | PySide6 desktop app (`sort_panel.py` is the Sort raw files tab) |
 
 The engine never prints or calls `input()`. Progress goes to a `progress(done, total, message)` callback, and a
 `CancelToken` stops a job between batches, which is what a GUI needs.
@@ -265,5 +312,5 @@ Clean-up:
 ## Tests
 
 ```bash
-pytest            # or: python tests/test_engine.py && python tests/test_effects.py && python tests/test_gui.py
+pytest            # or run each file: tests/test_engine.py, test_effects.py, test_sorter.py, test_gui.py
 ```

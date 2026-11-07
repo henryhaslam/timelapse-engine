@@ -6,7 +6,13 @@ Processors are written once against the NumPy API and run on either NumPy
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
+
+# CuPy warns when CUDA_PATH isn't set even though it finds the pip-installed CUDA libraries
+# (the laptop setup); the cp.zeros check below is the real test.
+warnings.filterwarnings("ignore", message="CUDA path could not be detected", category=UserWarning)
 
 try:  # CuPy is optional.
     import cupy as cp
