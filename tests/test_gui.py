@@ -130,8 +130,16 @@ def test_gui_end_to_end(screenshot: str = None):
         win.process_combo.setCurrentIndex(win.process_combo.findData("average"))
         win.blend_spin.setValue(4)
         win.step_spin.setValue(2)
-        win.master_combo.setCurrentIndex(win.master_combo.findData("prores"))
-        win.p1080_check.setChecked(True)
+        full_check, full_format = win.video_rows["full"]
+        p1080_check, p1080_format = win.video_rows["1080p"]
+        assert win._video_box.isVisible() and not win.ext_combo.isVisible()
+        assert full_check.text() == "Full res  160×120"                     # real sizes once a source is loaded
+        assert p1080_check.text() == "1080p  160×120 (= full)"              # 120 px tall: no upscaling
+        full_check.setChecked(True)
+        full_format.setCurrentIndex(full_format.findData("prores"))
+        p1080_check.setChecked(True)
+        assert p1080_format.isEnabled() and not win.video_rows["4k"][1].isEnabled()
+        assert win.current_job().videos == [{"size": "full", "format": "prores"}, {"size": "1080p", "format": "h264"}]
         win.add_to_queue()
         win.kind_combo.setCurrentIndex(win.kind_combo.findData("frames"))
         win.process_combo.setCurrentIndex(win.process_combo.findData("motion_overlay"))

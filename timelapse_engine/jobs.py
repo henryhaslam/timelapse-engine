@@ -22,13 +22,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from . import backend, engine, files
+from .outputs import VIDEO_SIZES, legacy_videos, parse_videos
 from .processors import PROCESSORS, create_processor
 from .progress import CancelToken, ProgressCallback
 from .sources import FrameSource, ImageSequence, SubsetSource, VideoSource
 
 KINDS = {"still": "Single image", "video": "Video", "frames": "Image sequence"}
-MASTERS = {"prores": "ProRes 422 HQ (CPU)", "hevc_nvenc": "HEVC 10-bit (NVIDIA GPU)",
-           "hevc_lossless": "HEVC lossless (slow)", None: "None"}
+FORMAT_SHORT = {"prores": "ProRes", "hevc_nvenc": "HEVC", "h264": "H.264", "hevc_lossless": "HEVC lossless"}
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".mts", ".mxf")
 
 
@@ -147,9 +147,8 @@ class Job:
     blend: int = 8                      # video / image sequence
     step: int = 1
     fps: float = 24.0
-    master: Optional[str] = "prores"
-    preview_1080p: bool = False
-    preview_4k: bool = False
+    # video files: [{"size": "full" | "4k" | "1080p", "format": "prores" | "hevc_nvenc" | "h264" | "hevc_lossless"}]
+    videos: List[Dict[str, str]] = field(default_factory=lambda: [{"size": "full", "format": "prores"}])
     device: str = "auto"
     overwrite: str = "increment"
     deflicker: bool = False             # even out frame-to-frame brightness first
@@ -161,6 +160,11 @@ class Job:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Job":
+        data = dict(data)
+        if "videos" not in data and any(k in data for k in ("master", "preview_1080p", "preview_4k")):
+            # Queue files from before the size/format tick boxes: master + H.264 previews
+            pairs = legacy_videos(data.get("master"), bool(data.get("preview_1080p")), bool(data.get("preview_4k")))
+            data["videos"] = [{"size": s, "format": f} for s, f in pairs]
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in data.items() if k in known})
 
@@ -183,8 +187,12 @@ class Job:
                 errors.append(str(exc))
         if self.kind in ("video", "frames") and (self.blend < 1 or self.step < 1):
             errors.append("Blend and step must be at least 1.")
-        if self.kind == "video" and not (self.master or self.preview_1080p or self.preview_4k):
-            errors.append("Pick at least one video output (master or preview).")
+        if self.kind == "video":
+            try:
+                if not parse_videos(self.videos):
+                    errors.append("Tick at least one video size to export.")
+            except ValueError as exc:
+                errors.append(str(exc))
         if self.end_frame is not None and self.end_frame <= self.first_frame:
             errors.append("The frame range is empty.")
         return errors
@@ -199,9 +207,9 @@ class Job:
         if self.kind == "still":
             what = f"{self.process} -> {self.ext.upper()}"
         elif self.kind == "video":
-            outs = [o for o, on in ((self.master, bool(self.master)), ("1080p", self.preview_1080p),
-                                    ("4K", self.preview_4k)) if on]
-            what = f"{self.process} blend {self.blend} step {self.step} -> {' + '.join(outs)}"
+            outs = [f"{'full' if v.get('size') == 'full' else VIDEO_SIZES.get(v.get('size'), '?')} "
+                    f"{FORMAT_SHORT.get(v.get('format'), '?')}" for v in self.videos]
+            what = f"{self.process} blend {self.blend} step {self.step} -> {' + '.join(outs) or 'no video'}"
         else:
             what = f"{self.process} blend {self.blend} step {self.step} -> {self.ext.upper()} frames"
         extras = [x for x, on in (("deflicker", self.deflicker),
@@ -281,8 +289,7 @@ def run_job(job: Job, sources: Optional[SourceCache] = None, progress: Optional[
                                          overwrite=job.overwrite, **common)]
         if job.kind == "video":
             return engine.render_video(src, job.process, job.export_dir, name, blend=job.blend, step=job.step,
-                                       fps=job.fps, master=job.master, preview_1080p=job.preview_1080p,
-                                       preview_4k=job.preview_4k, overwrite=job.overwrite,
+                                       fps=job.fps, videos=job.videos, overwrite=job.overwrite,
                                        interpolate=job.interpolate, **common)
         return engine.render_frames(src, job.process, Path(job.export_dir) / f"{name}_{job.process}_frames", name,
                                     blend=job.blend, step=job.step, ext=job.ext, overwrite=job.overwrite,

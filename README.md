@@ -30,6 +30,18 @@ The app has two tabs: **Sort raw files** (below) and **Stack and render**.
   list…**) lets you tick the effects you use; the rest are hidden. **Settings → Show all effects** brings every
   effect back and keeps your ticks for later. A saved job whose effect is hidden still loads, and the effect
   appears in the list marked *not in your list*.
+- **Video files:** for a video, tick the sizes you want. Each one gets its own format:
+
+  | Size | Size of the G9 II's 5776×4336 frames | File |
+  |---|---|---|
+  | Full res | 5776×4336 | `<name>_MASTER.mov` (or `_full.mp4` for H.264) |
+  | 4K | 3840×2882 (long side 3840) | `<name>_4K.mov` / `.mp4` |
+  | 1080p | 1438×1080 (short side 1080) | `<name>_1080p.mov` / `.mp4` |
+
+  Formats are **ProRes HQ .mov** (the editing master, CPU), **HEVC .mov (GPU)** (fast and small, needs a recent
+  NVIDIA driver), **H.264 .mp4** (plays anywhere) and **HEVC lossless .mov** (archive). The tick boxes show the
+  real size once a source is loaded, and a size is never larger than the frames. A common choice is Full res
+  ProRes for editing plus 1080p H.264 to check the result. Every file comes from the same single render.
 - **Preview** (Ctrl+P) renders the current settings in about a second at reduced resolution, using frames spread
   across the sequence for a still, or the rolling window at the scrubber for video. With *Update automatically*
   on, it re-renders as you change settings or scrub. Wheel to zoom, drag to pan, double-click to fit.
@@ -107,11 +119,14 @@ progress = te.ConsoleProgress()
 # Whole sequence -> one image
 te.stack_to_file(r"E:\TL\shoot", "maximum", r"E:\TL\out", ext="tiff", progress=progress)
 
-# Rolling window -> video (ProRes master + 1080p preview)
-te.render_video(r"E:\TL\shoot", "average", r"E:\TL\out", blend=8, step=3, fps=24, progress=progress)
+# Rolling window -> video: full-res ProRes master + 1080p H.264 to check it
+te.render_video(r"E:\TL\shoot", "average", r"E:\TL\out", blend=8, step=3, fps=24,
+                videos=[("full", "prores"), ("1080p", "h264")], progress=progress)
 
-# Same, with the much faster GPU HEVC master
-te.render_video(r"E:\TL\shoot", "average", r"E:\TL\out", blend=8, step=3, master="hevc_nvenc", progress=progress)
+# Sizes: "full", "4k", "1080p". Formats: "prores", "hevc_nvenc" (GPU, much faster), "h264", "hevc_lossless".
+# The older master= / preview_1080p= / preview_4k= arguments still work.
+te.render_video(r"E:\TL\shoot", "average", r"E:\TL\out", blend=8, step=3,
+                videos=[("full", "hevc_nvenc"), ("4k", "h264")], progress=progress)
 
 # Video file in, still out
 te.stack_to_file(r"E:\clip.mp4", "motion_overlay", r"E:\out", motion_threshold=20, progress=progress)

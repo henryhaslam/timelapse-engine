@@ -20,13 +20,16 @@ from typing import Dict, List, Optional
 from PySide6.QtCore import QByteArray, QSettings, QSize, Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog,
-                               QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
+                               QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+                               QMainWindow,
                                QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
                                QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
                                QVBoxLayout, QWidget)
 
 from .. import __version__, backend
-from ..jobs import (KINDS, MASTERS, Job, SourceCache, default_export, is_video, load_queue, render_preview,
+from ..colour import output_size
+from ..outputs import VIDEO_FORMATS, VIDEO_SIZES, video_target
+from ..jobs import (KINDS, Job, SourceCache, default_export, is_video, load_queue, render_preview,
                     save_queue)
 from ..processors import PROCESSORS
 from ..progress import CancelToken, logger
@@ -65,6 +68,7 @@ PREVIEW_SIZES = {"Fast (960 px)": 960, "Normal (1280 px)": 1280, "Large (1920 px
 DISPLAY_MAX_SIDE = 1920
 
 TAB_SORT, TAB_ENGINE = 0, 1
+VIDEO_CHECK_LABELS = {"full": "Full res", "4k": "4K", "1080p": "1080p"}   # short: the panel is narrow
 
 STATUS_WAITING, STATUS_RUNNING, STATUS_DONE = "Waiting", "Running", "Done"
 STATUS_FAILED, STATUS_CANCELLED = "Failed", "Cancelled"
@@ -277,19 +281,35 @@ class MainWindow(QMainWindow):
         self.ext_combo.addItem("JPEG", "jpg")
         self._ext_label = QLabel("Format")
         out_form.addRow(self._ext_label, self.ext_combo)
-        self.master_combo = QComboBox()
-        for key, label in MASTERS.items():
-            self.master_combo.addItem(label, key)
-        self._master_label = QLabel("Master")
-        out_form.addRow(self._master_label, self.master_combo)
-        prev_row = QHBoxLayout()
-        self.p1080_check = QCheckBox("1080p preview")
-        self.p4k_check = QCheckBox("4K preview")
-        prev_row.addWidget(self.p1080_check)
-        prev_row.addWidget(self.p4k_check)
-        prev_row.addStretch(1)
-        self._previews_label = QLabel("Previews")
-        out_form.addRow(self._previews_label, prev_row)
+        # Video files: tick each size to export, each with its own format
+        self.video_rows: Dict[str, tuple] = {}
+        self._video_box = QWidget()
+        grid = QGridLayout(self._video_box)
+        grid.setContentsMargins(0, 0, 0, 0)
+        default_format = {"full": "prores", "4k": "h264", "1080p": "h264"}
+        tips = {"full": "Every pixel of the frames: the master for editing or archiving.",
+                "4k": "Long side 3840 px (never larger than the frames).",
+                "1080p": "Short side 1080 px: a small, quick file to check the result."}
+        for r, size in enumerate(VIDEO_SIZES):
+            check = QCheckBox(VIDEO_CHECK_LABELS[size])
+            check.setToolTip(f"{VIDEO_SIZES[size]}: {tips[size]}")
+            combo = QComboBox()
+            for key, (text, _ext, tip) in VIDEO_FORMATS.items():
+                combo.addItem(text, key)
+                combo.setItemData(combo.count() - 1, tip, Qt.ToolTipRole)
+            combo.setCurrentIndex(combo.findData(default_format[size]))
+            combo.setEnabled(False)
+            check.toggled.connect(combo.setEnabled)
+            grid.addWidget(check, r, 0)
+            grid.addWidget(combo, r, 1)
+            self.video_rows[size] = (check, combo)
+        grid.setColumnStretch(1, 1)
+        self.video_rows["full"][0].setChecked(True)
+        for check, combo in self.video_rows.values():   # after the default, so building the form doesn't fire them
+            check.toggled.connect(self._on_settings_changed)
+            combo.currentIndexChanged.connect(self._on_settings_changed)
+        self._videos_label = QLabel("Video files")
+        out_form.addRow(self._videos_label, self._video_box)
         self.device_combo = QComboBox()
         self.device_combo.addItem("Auto (GPU when possible)", "auto")
         self.device_combo.addItem("GPU", "gpu")
@@ -477,9 +497,7 @@ class MainWindow(QMainWindow):
             blend=self.blend_spin.value(),
             step=self.step_spin.value(),
             fps=float(self.fps_spin.value()),
-            master=self.master_combo.currentData(),
-            preview_1080p=self.p1080_check.isChecked(),
-            preview_4k=self.p4k_check.isChecked(),
+            videos=self.chosen_videos(),
             device=self.device_combo.currentData(),
             overwrite=self.overwrite_combo.currentData(),
             deflicker=self.deflicker_check.isChecked(),
@@ -494,7 +512,7 @@ class MainWindow(QMainWindow):
                 self._fill_process_combo(job.process)       # the job's effect is hidden: list it anyway
             for combo, value in ((self.kind_combo, job.kind), (self.process_combo, job.process),
                                  (self.sort_combo, job.sort), (self.ext_combo, job.ext),
-                                 (self.master_combo, job.master), (self.device_combo, job.device),
+                                 (self.device_combo, job.device),
                                  (self.overwrite_combo, job.overwrite)):
                 idx = combo.findData(value)
                 if idx >= 0:
@@ -504,8 +522,7 @@ class MainWindow(QMainWindow):
             self.blend_spin.setValue(job.blend)
             self.step_spin.setValue(job.step)
             self.fps_spin.setValue(int(round(job.fps)))
-            self.p1080_check.setChecked(job.preview_1080p)
-            self.p4k_check.setChecked(job.preview_4k)
+            self.set_videos(job.videos)
             self.deflicker_check.setChecked(job.deflicker)
             self.deflicker_spin.setValue(job.deflicker_window)
             self.interp_combo.setCurrentIndex(max(0, self.interp_combo.findData(job.interpolate)))
@@ -575,6 +592,7 @@ class MainWindow(QMainWindow):
         self._apply_range()
         if info["kind"] == "video" and info["fps"]:
             self.fps_spin.setValue(int(round(info["fps"])))
+        self._update_video_labels(info["shape"])
         out_dir, _ = default_export(info["path"])
         if not self.export_picker.path() or self.export_picker.path() == self._auto_export_dir:
             self.export_picker.set_path(out_dir)
@@ -759,12 +777,33 @@ class MainWindow(QMainWindow):
         for w in (self._blend_label, self.blend_spin, self._step_label, self.step_spin, self._interp_label,
                   self.interp_combo):
             w.setVisible(rolling)
-        for w in (self._fps_label, self.fps_spin, self._master_label, self.master_combo, self._previews_label,
-                  self.p1080_check, self.p4k_check):
+        for w in (self._fps_label, self.fps_spin, self._videos_label, self._video_box):
             w.setVisible(kind == "video")
         for w in (self._ext_label, self.ext_combo):
             w.setVisible(kind != "video")
         self._on_settings_changed()
+
+    # ------------------------------------------------------------ video files
+    def chosen_videos(self) -> List[Dict[str, str]]:
+        """The ticked video sizes with their formats, e.g. [{"size": "full", "format": "prores"}]."""
+        return [{"size": size, "format": combo.currentData()}
+                for size, (check, combo) in self.video_rows.items() if check.isChecked()]
+
+    def set_videos(self, videos) -> None:
+        chosen = {v.get("size"): v.get("format") for v in videos or [] if isinstance(v, dict)}
+        for size, (check, combo) in self.video_rows.items():
+            check.setChecked(size in chosen)
+            if size in chosen and combo.findData(chosen[size]) >= 0:
+                combo.setCurrentIndex(combo.findData(chosen[size]))
+
+    def _update_video_labels(self, shape) -> None:
+        """Show the real output size next to each tick box once a source is loaded."""
+        h, w = shape[0], shape[1]
+        full = output_size(h, w, None)
+        for size, (check, _combo) in self.video_rows.items():
+            oh, ow = output_size(h, w, video_target(size, shape))
+            note = " (= full)" if size != "full" and (oh, ow) == full else ""
+            check.setText(f"{VIDEO_CHECK_LABELS[size]}  {ow}×{oh}{note}")
 
     # ------------------------------------------------------------ effect list
     def _visible_effects(self) -> Optional[set]:

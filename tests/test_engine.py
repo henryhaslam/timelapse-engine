@@ -514,6 +514,88 @@ def test_render_video_and_frames():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_video_sizes_and_formats():
+    """Each ticked size/format makes its own file at the right size: 1080p is short side 1080,
+    4K never upscales past the frames, and the names match the ones the app always used."""
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        print("  (ffmpeg/ffprobe not on PATH, skipping)")
+        return
+    import subprocess
+
+    def dims(path):
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                              "stream=width,height,codec_name", "-of", "csv=p=0", str(path)],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        codec, w, h = out.split(",")
+        return codec, int(w), int(h)
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        frames = np.random.default_rng(3).random((4, 1200, 1600, 3), dtype=np.float32)   # 4:3 landscape
+        outs = te.render_video(ArraySource(frames), "average", tmp, "clip", blend=2, step=2,
+                               videos=[("full", "h264"), ("4k", "h264"), {"size": "1080p", "format": "prores"}])
+        assert [p.name for p in outs] == ["clip_full.mp4", "clip_4K.mp4", "clip_1080p.mov"], outs
+        assert dims(outs[0]) == ("h264", 1600, 1200)
+        assert dims(outs[1]) == ("h264", 1600, 1200)                   # 4K is bigger than the frames: no upscale
+        assert dims(outs[2]) == ("prores", 1440, 1080)
+        portrait = te.render_video(ArraySource(frames.transpose(0, 2, 1, 3).copy()), "average", tmp, "tall",
+                                   blend=2, step=2, videos=[("1080p", "h264")])
+        assert dims(portrait[0])[1:] == (1080, 1440)                   # short side 1080 when upright too
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_job_videos_and_old_queue_files():
+    from timelapse_engine.jobs import Job
+
+    old = Job.from_dict({"kind": "video", "master": "hevc_nvenc", "preview_1080p": True, "preview_4k": False})
+    assert old.videos == [{"size": "full", "format": "hevc_nvenc"}, {"size": "1080p", "format": "h264"}]
+    assert "full HEVC + 1080p H.264" in old.describe()
+    assert Job.from_dict({"kind": "video", "master": None, "preview_1080p": True}).videos == \
+        [{"size": "1080p", "format": "h264"}]
+    assert Job().videos == [{"size": "full", "format": "prores"}]       # default: the ProRes master as before
+    assert Job.from_dict(Job(videos=[{"size": "4k", "format": "h264"}]).to_dict()).videos == \
+        [{"size": "4k", "format": "h264"}]
+    nothing = Job(kind="video", source=".", export_dir=".", videos=[])
+    assert any("Tick at least one video size" in e for e in nothing.validate())
+    bad = Job(kind="video", source=".", export_dir=".", videos=[{"size": "8k", "format": "h264"}])
+    assert any("Unknown video output" in e for e in bad.validate())
+
+
+def test_ffmpeg_message_explains_failures():
+    """FFmpeg's reason is kept, without its [codec @ 0x...] prefixes and the generic follow-on lines."""
+    from timelapse_engine.outputs import ffmpeg_message
+
+    nvenc = [  # what FFmpeg 9.0 printed on a laptop with NVIDIA driver 566.07
+        "[hevc_nvenc @ 000001e25ac45b00] Driver does not support the required nvenc API version. Required: 13.1 Found: 12.2",
+        "[hevc_nvenc @ 000001e25ac45b00] The minimum required Nvidia driver for nvenc is 610.00 or newer",
+        "[vost#0:0/hevc_nvenc @ 000001e25ac45080] [enc:hevc_nvenc @ 000001e25ac43d80] Error while opening encoder - "
+        "maybe incorrect parameters such as bit_rate, rate, width or height.",
+        "[vf#0:0 @ 000001e25ac609c0] Task finished with error code: -40 (Function not implemented)",
+    ]
+    msg = ffmpeg_message(nvenc, -40, te.outputs.hevc_nvenc_master("x.mov").codec_args)
+    assert "610.00 or newer" in msg and "update the NVIDIA driver" in msg, msg
+    assert "@" not in msg and "maybe incorrect parameters" not in msg and "Task finished" not in msg, msg
+    assert ffmpeg_message([], 4294967256) == "FFmpeg exited with code 4294967256."
+
+
+def test_video_sink_stops_before_rendering_when_encoder_cannot_start():
+    if shutil.which("ffmpeg") is None:
+        print("  (ffmpeg not on PATH, skipping)")
+        return
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        bad = te.VideoOutput(tmp / "clip.mp4", ["-c:v", "no_such_encoder"], "yuv420p")
+        try:
+            te.FFmpegVideoSink([bad], fps=24)
+            raise AssertionError("sink accepted an encoder FFmpeg doesn't have")
+        except RuntimeError as exc:
+            assert "clip.mp4" in str(exc) and "no_such_encoder" in str(exc), exc
+        assert not any(tmp.iterdir())                                 # nothing created
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_console_progress_on_any_encoding():
     """Output redirected on Windows uses the ANSI code page (cp1252), which has no block character:
     the bar falls back to '#', and characters it can't write in the message become '?'."""

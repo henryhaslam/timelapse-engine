@@ -23,8 +23,8 @@ import numpy as np
 
 from . import backend, files, metadata
 from .backend import HAS_CUPY, asnumpy, cp
-from .outputs import (FFmpegVideoSink, ImageSequenceSink, Sink, h264_preview, hevc_lossless_master,
-                      hevc_nvenc_master, prores_master)
+from .outputs import (FFmpegVideoSink, ImageSequenceSink, Sink, legacy_videos, parse_videos, video_file_name,
+                      video_output)
 from .processors import Processor, create_processor
 from .progress import CancelToken, ProgressCallback, check_cancel, logger, report
 from .sources import FrameSource, ImageSequence, SubsetSource, VideoSource
@@ -483,13 +483,16 @@ def render_video(source, process: ProcessorSpec, export_dir, export_name: Option
                  ffmpeg_path: str = "ffmpeg", overwrite: str = "increment", include_partial: bool = True,
                  progress: Optional[ProgressCallback] = None, cancel: Optional[CancelToken] = None,
                  device: str = "auto", batch_size: Optional[int] = None, deflicker: bool = False,
-                 deflicker_window: int = 15, interpolate: int = 1, **params) -> list:
+                 deflicker_window: int = 15, interpolate: int = 1, videos=None, **params) -> list:
     """Render a rolling-window blend straight to video.
 
-    master: "prores" (ProRes 422 HQ .mov, CPU encoder, ~8 fps at 20 MP),
-            "hevc_nvenc" (10-bit HEVC .mov on the NVIDIA encoder, ~3x faster),
-            "hevc_lossless" (.mov, slow) or None.
-    preview_1080p / preview_4k: H.264 .mp4 previews.
+    videos: the files to write, as (size, format) pairs or {"size", "format"} dicts:
+            size "full", "4k" (long side 3840) or "1080p" (short side 1080), never larger than
+            the frames; format "prores" (ProRes 422 HQ .mov, CPU, ~8 fps at 20 MP), "hevc_nvenc"
+            (10-bit HEVC .mov on the NVIDIA encoder, ~3x faster), "h264" (.mp4, plays anywhere)
+            or "hevc_lossless" (.mov, slow). E.g. [("full", "prores"), ("1080p", "h264")].
+    master / preview_1080p / preview_4k: the older way to say the same, used when ``videos``
+            is None: master = full-size format or None; previews = H.264 at 1080p / 4K.
     fps: defaults to the source video's frame rate, or 24 for image sequences.
     Returns the list of files written.
     """
@@ -498,21 +501,14 @@ def render_video(source, process: ProcessorSpec, export_dir, export_name: Option
     export_name = export_name or src.name
     fps = fps or src.fps or 24
 
-    outputs = []
-    if master == "prores":
-        outputs.append(prores_master(export_dir / f"{export_name}_MASTER.mov"))
-    elif master == "hevc_lossless":
-        outputs.append(hevc_lossless_master(export_dir / f"{export_name}_MASTER.mov"))
-    elif master == "hevc_nvenc":
-        outputs.append(hevc_nvenc_master(export_dir / f"{export_name}_MASTER.mov"))
-    elif master is not None:
-        raise ValueError("master must be 'prores', 'hevc_nvenc', 'hevc_lossless' or None")
-    if preview_1080p:
-        outputs.append(h264_preview(export_dir / f"{export_name}_1080p.mp4", height=1080))
-    if preview_4k:
-        outputs.append(h264_preview(export_dir / f"{export_name}_4K.mp4", width=3840))
-    if not outputs:
+    if master not in (None, "prores", "hevc_nvenc", "hevc_lossless", "h264"):
+        raise ValueError("master must be 'prores', 'hevc_nvenc', 'hevc_lossless', 'h264' or None")
+    chosen = parse_videos(videos) if videos is not None else legacy_videos(master, preview_1080p, preview_4k)
+    if not chosen:
         raise ValueError("No video outputs selected.")
+    shape = src.probe()[0]
+    outputs = [video_output(export_dir / video_file_name(export_name, size, fmt), size, fmt, shape)
+               for size, fmt in chosen]
 
     name = process.name if isinstance(process, Processor) else process
     n_out = len(window_starts(len(src), blend, step, include_partial))

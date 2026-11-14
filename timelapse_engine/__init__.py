@@ -16,7 +16,8 @@ from .engine import (
     use_gpu,
 )
 from .files import SequenceMismatchError, load_image, load_raw, save_image
-from .outputs import FFmpegVideoSink, ImageSequenceSink, VideoOutput, h264_preview, hevc_lossless_master, prores_master
+from .outputs import (VIDEO_FORMATS, VIDEO_SIZES, FFmpegVideoSink, ImageSequenceSink, VideoOutput, h264_preview,
+                      hevc_lossless_master, prores_master, video_output)
 from .processors import PROCESSORS, Processor, create_processor, list_processors
 from .progress import CancelToken, Cancelled, ConsoleProgress, enable_console_logging
 from .jobs import Job, load_queue, run_job, save_queue

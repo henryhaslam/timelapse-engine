@@ -31,6 +31,8 @@ moving clouds and water, so new effects in that spirit are welcome.
 - On the laptop, Git (installed with winget) is on `PATH` and signed in through Git Credential Manager; there is
   no `gh`. Python is 3.14 from the Python install manager. If `python` opens the Microsoft Store, use `py`, or the
   full path `%LOCALAPPDATA%\Python\bin\python.exe`.
+- The laptop's FFmpeg is 9.0 (Gyan full build, from winget). Its NVENC needs NVIDIA driver 610 or newer. On
+  2026-11-14 the laptop had 566.07, so `hevc_nvenc` masters failed until the owner updates the driver.
 - The laptop has 8 GB of VRAM, so check heavy effects there with `benchmarks/memory_bench.py`. `clipped_average`
   and `rhythm_map` reached about 7.7 GB at 20 MP on the desktop.
 
@@ -52,7 +54,7 @@ moving clouds and water, so new effects in that spirit are welcome.
 ```bash
 pip install -e ".[gpu,gui]"          # gpu = cupy-cuda12x; leave it out on a machine without an NVIDIA GPU
 python -m timelapse_engine.gui        # or double-click "Timelapse Engine.bat"
-python tests/test_engine.py           # 24 tests: engine, outputs, metadata, YUV packing, progress bar
+python tests/test_engine.py           # 28 tests: engine, outputs, video sizes, metadata, YUV packing, FFmpeg errors
 python tests/test_effects.py          # 21 tests: each new effect does what it claims
 python tests/test_sorter.py           # 22 tests: finding sequences, move/copy/undo safety, folder layout
 python tests/test_gui.py              # headless (Qt offscreen): load, preview, queue, run; Sort tab
@@ -96,6 +98,11 @@ Interpolation writes the in-between frames to the sinks.
 **Outputs:**
 - `outputs.py`: numbered stills (4 writer threads), plus one FFmpeg process per video output.
 - Video data goes through the pipe in 4 MB writes, because huge single writes are slow on Windows.
+- **Before rendering,** `FFmpegVideoSink` encodes two tiny raw frames with each output's settings
+  (`_encoder_problem`, cached per session). An encoder that can't start then stops the job before any frame is
+  read, and leaves no empty files. FFmpeg's stderr is captured, and `ffmpeg_message` turns it into the error
+  text, so failures show FFmpeg's reason, not just "Broken pipe". FFmpeg runs with `CREATE_NO_WINDOW`, so the
+  desktop app doesn't open console windows.
 - `colour.py` packs BT.709 limited-range Y'CbCr on the GPU.
 
 **Metadata** (`metadata.py`):
@@ -106,6 +113,13 @@ Interpolation writes the in-between frames to the sinks.
 
 **Jobs and GUI:**
 - `jobs.Job` is one saveable render description, run with `run_job` and `render_preview`.
+- **Video files:** `Job.videos` is a list of `{"size": "full"|"4k"|"1080p", "format":
+  "prores"|"hevc_nvenc"|"h264"|"hevc_lossless"}`. In the GUI that's a tick box and a format dropdown per size.
+  `outputs.video_output` and `video_file_name` turn each entry into a `VideoOutput`. The names
+  (`_MASTER.mov`, `_4K`, `_1080p`) are the ones the old master and previews used. 4K means long side 3840 and
+  1080p means short side 1080, so portrait frames work too, and `colour.output_size` never upscales.
+  `Job.from_dict` converts old queue files (`master`, `preview_1080p`, `preview_4k`), and `render_video` still
+  takes those arguments.
 - The GUI (`gui/app.py`) builds each effect's settings form from its constructor signature through
   `jobs.processor_params`.
 - Long work runs on QThreads (`gui/worker.py`). Settings are saved in `%APPDATA%\timelapse-engine\gui.ini`.
