@@ -612,13 +612,17 @@ class TimeSliceProcessor(_Indexed):
 
     pattern: left_to_right, top_to_bottom, diagonal (at ``angle``), radial (centre
     outwards), circular (a clock sweep starting at ``angle``) or brightness (bright
-    parts of the first frame from late in the sequence).
+    parts of a reference image from late in the sequence).
     slices: 0 = smooth (every column/ring from its own moment, blended between
     neighbouring frames); N = N bands, each from one frame.
     feather: 0-1 fraction of a band over which neighbouring bands blend (through
     the frames in between).
     reverse: run time the other way. mirror: there and back (e.g. night in the middle).
     curve: <1 gives more of the image to the end of the sequence, >1 to the start.
+    map_from: for the brightness pattern, the image whose brightness decides when each
+    part comes from: the first, middle or last frame, or the average of all frames (a
+    long exposure, which gives softer contours). Anything but "first" reads the frames
+    twice: once to build the map, once to blend.
     """
 
     name = "time_slice"
@@ -627,15 +631,22 @@ class TimeSliceProcessor(_Indexed):
                    "Smooth or banded, along lines, rings, a clock sweep or by brightness.")
     state_frames = 4.0
     PATTERNS = ("left_to_right", "top_to_bottom", "diagonal", "radial", "circular", "brightness")
+    MAP_FROM = ("first", "middle", "last", "average")
 
     def __init__(self, pattern: str = "left_to_right", slices: int = 0, feather: float = 0.0,
-                 angle: float = 45.0, reverse: bool = False, mirror: bool = False, curve: float = 1.0):
+                 angle: float = 45.0, reverse: bool = False, mirror: bool = False, curve: float = 1.0,
+                 map_from: str = "first"):
         if pattern not in self.PATTERNS:
             raise ValueError(f"pattern must be one of {', '.join(self.PATTERNS)}")
+        if map_from not in self.MAP_FROM:
+            raise ValueError(f"map_from must be one of {', '.join(self.MAP_FROM)}")
         if slices < 0 or not 0 <= feather <= 1 or curve <= 0:
             raise ValueError("slices >= 0, 0 <= feather <= 1 and curve > 0 are required")
         self.pattern, self.slices, self.feather = pattern, int(slices), float(feather)
         self.angle, self.reverse, self.mirror, self.curve = float(angle), bool(reverse), bool(mirror), float(curve)
+        self.map_from = map_from
+        # A brightness map from any frame but the first has to be built before blending starts
+        self.two_pass = pattern == "brightness" and map_from != "first"
         self.reset()
 
     def reset(self):
@@ -643,11 +654,43 @@ class TimeSliceProcessor(_Indexed):
         self.canvas = None
         self.weight = None
         self.n_frames, self.indices, self._k = 0, [], 0
+        self._map_luma, self._map_count, self._seen = None, 0, 0
+
+    # -- the brightness map (first pass, when it isn't from the first frame) ----
+    def update(self, batch):
+        if self.two_pass:
+            self._collect_map(batch)
+        else:
+            self._accumulate(batch)
+
+    def _collect_map(self, batch):
+        count = len(self.indices) or self.n_frames
+        target = {"middle": (count - 1) // 2, "last": count - 1}.get(self.map_from)
+        for frame in batch:
+            k = self._seen
+            self._seen += 1
+            if self.map_from == "average":
+                y = _luma(frame).astype(xp_of(frame).float32)
+                if self._map_luma is None:
+                    self._map_luma = y
+                else:
+                    self._map_luma += y
+                self._map_count += 1
+            elif k == target or (target is not None and target < 0):
+                self._map_luma = _luma(frame).astype(xp_of(frame).float32)   # a copy, not a view of the batch
+
+    def begin_second_pass(self):
+        self._k = 0
+        if self.map_from == "average" and self._map_count:
+            self._map_luma /= self._map_count
+
+    def update_second_pass(self, batch):
+        self._accumulate(batch)
 
     # -- the time map ----------------------------------------------------------
     def _shape_map(self, xp, h, w, first_frame):
         if self.pattern == "brightness":
-            y = _luma(first_frame)
+            y = self._map_luma if self._map_luma is not None else _luma(first_frame)
             y = _ndimage(xp).uniform_filter(y, size=max(3, max(h, w) // 150), mode="nearest")
             lo, hi = float(xp.percentile(y[::4, ::4], 1)), float(xp.percentile(y[::4, ::4], 99))
             return xp.clip((y - lo) / max(hi - lo, 1e-6), 0, 1).astype(xp.float32)
@@ -698,7 +741,7 @@ class TimeSliceProcessor(_Indexed):
         return sorted({int(round(k / (self.slices - 1) * (n_frames - 1))) for k in range(self.slices)})
 
     # -- accumulation ------------------------------------------------------------
-    def update(self, batch):
+    def _accumulate(self, batch):
         xp = xp_of(batch)
         for frame in batch:
             idx = self._next_index()

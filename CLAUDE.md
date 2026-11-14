@@ -42,6 +42,7 @@ moving clouds and water, so new effects in that spirit are welcome.
   refused the DNG ("does not contain a supported format"). The owner dropped the idea because the entropy
   effects can't use raw mosaics. Leave it as is unless asked.
 - `feature/effects`, `feature/raw-sorter` and `feature/gui` are merged; new work branches from `main`.
+- `feature/time-slice-map`: the `map_from` setting for the brightness time slice.
 
 ## Setup, run, test
 
@@ -81,6 +82,9 @@ are on the GPU, then become float32 0-1 in chunks sized by `engine.MemoryPlan`, 
   - `window_add`, `window_remove`, `window_result`: exact running sums for rolling windows (`average`,
     `temporal_std`).
 - **Same code on CPU and GPU:** write it once with `xp = xp_of(array)`, and it runs on NumPy or CuPy.
+- **`two_pass` can be set per instance:** the engine reads it at run time. `time_slice` sets it only for
+  `pattern="brightness"` with `map_from` other than `first`: pass 1 builds the brightness map (one frame, or
+  the average), pass 2 blends. The default stays a single pass.
 
 **Rolling windows** (`render_windows`, `render_video`, `render_frames`): each frame is decoded and uploaded once.
 The window cache lives in VRAM or RAM, as `MemoryPlan` decides. Deflicker corrects frames as they enter the cache.

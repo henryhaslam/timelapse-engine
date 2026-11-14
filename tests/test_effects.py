@@ -190,6 +190,49 @@ def test_time_slice_patterns_and_feather():
     assert len(np.unique(np.round(soft[0, :, 0], 4))) > 3            # edges pass through in-between frames
 
 
+def test_time_slice_brightness_map_from():
+    """The brightness pattern takes its map from the chosen image: bright there = late frames.
+    Green carries a different brightness pattern per frame; blue is each frame's own time stamp,
+    so the result's blue channel shows which moment each pixel came from."""
+    n = 9
+    x = np.linspace(0, 1, W, dtype=np.float32)[None, :].repeat(H, 0)
+    y = np.linspace(0, 1, H, dtype=np.float32)[:, None].repeat(W, 1)
+    frames = np.zeros((n, H, W, 3), np.float32)
+    for k in range(n):
+        frames[k, ..., 1] = {0: x, n // 2: y, n - 1: 1 - x}.get(k, 1 - y)   # first: lit from the left,
+        frames[k, ..., 2] = k / (n - 1)                                      # middle: bottom, last: right,
+    # others: top, so the average of all frames is brightest at the top
+
+    def left_to_right(out):
+        return out[:, -4:, 2].mean() - out[:, :4, 2].mean()
+
+    def top_to_bottom(out):
+        return out[-4:, :, 2].mean() - out[:4, :, 2].mean()
+
+    for device in DEVICES:
+        first = run("time_slice", frames, device, pattern="brightness")
+        assert left_to_right(first) > 0.6 and abs(top_to_bottom(first)) < 0.1, device
+        last = run("time_slice", frames, device, pattern="brightness", map_from="last")
+        assert left_to_right(last) < -0.6 and abs(top_to_bottom(last)) < 0.1, device
+        middle = run("time_slice", frames, device, pattern="brightness", map_from="middle")
+        assert top_to_bottom(middle) > 0.6 and abs(left_to_right(middle)) < 0.1, device
+        average = run("time_slice", frames, device, pattern="brightness", map_from="average")
+        assert top_to_bottom(average) < -0.6 and abs(left_to_right(average)) < 0.1, device
+
+    # Only a map from another frame needs the extra pass; other patterns ignore the setting
+    assert not te.create_processor("time_slice", pattern="brightness").two_pass
+    assert te.create_processor("time_slice", pattern="brightness", map_from="average").two_pass
+    assert not te.create_processor("time_slice", pattern="radial", map_from="average").two_pass
+    # Video windows run both passes too
+    window = te.process_window(te.create_processor("time_slice", pattern="brightness", map_from="last"), frames)
+    assert left_to_right(window) < -0.6
+    try:
+        te.create_processor("time_slice", map_from="sometimes")
+        raise AssertionError("bad map_from accepted")
+    except ValueError:
+        pass
+
+
 def test_time_slice_rolling_video_window():
     out = te.process_window(te.create_processor("time_slice"), ramp_frames(5))
     np.testing.assert_allclose(out[0, :, 0], np.linspace(0, 1, W), atol=1e-5)
