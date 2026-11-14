@@ -208,6 +208,28 @@ def test_running_sums_match_recompute():
 # GPU parity and vectorised maths
 # ---------------------------------------------------------------------------
 
+def test_gpu_batches_use_the_right_frames():
+    """Frames go through three reusable pinned buffers, and uploads from pinned memory are
+    asynchronous. A buffer must not be refilled with a later batch before its upload has
+    run, or the GPU stacks the wrong frames (found 2026-11-14: an average of 120 frames was
+    up to 14.5 % off, on the second and later runs in a session). Many batches and repeat
+    runs make that race show up if it's there."""
+    if not te.HAS_CUPY:
+        print("  (CuPy not available, skipping)")
+        return
+    rng = np.random.default_rng(21)
+    frames = rng.integers(0, 65535, (96, 300, 400, 3), dtype=np.uint16)
+    truth = frames.astype(np.float64).mean(axis=0) / 65535
+    for run in range(4):
+        out = te.stack(ArraySource(frames), te.create_processor("average"), batch_size=8, device="gpu")
+        assert np.abs(out - truth).max() < 1e-5, (run, float(np.abs(out - truth).max()))
+    windows, recompute = CaptureSink(), CaptureSink()
+    te.render_windows(ArraySource(frames[:40]), "average", [windows], 8, 8, device="gpu")
+    te.render_windows(ArraySource(frames[:40]), "average", [recompute], 8, 8, device="cpu")
+    for a, b in zip(windows.frames, recompute.frames):
+        assert np.abs(a.astype(int) - b.astype(int)).max() <= 1
+
+
 def test_gpu_matches_cpu_for_every_processor():
     if not te.HAS_CUPY:
         print("  (CuPy not available, skipping)")

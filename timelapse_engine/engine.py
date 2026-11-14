@@ -93,7 +93,12 @@ def iter_raw(source: FrameSource, index_lists: Sequence[Sequence[int]], pinned: 
         for k in range(len(index_lists)):
             batch = pending.pop(0).result()
             if k + in_flight < len(index_lists):
-                # Reuses the buffer the caller finished with on the previous iteration.
+                # Reuses the buffer the caller finished with on the previous iteration. Uploads from
+                # pinned memory are asynchronous, so first let the GPU finish copying out of it;
+                # otherwise it can stack frames of a later batch instead (the next batch is already
+                # decoded, so this wait costs little).
+                if pinned and backend.HAS_CUPY:
+                    backend.cp.cuda.Device().synchronize()
                 pending.append(prefetch.submit(load, k + in_flight))
             yield batch
 

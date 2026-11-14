@@ -54,7 +54,7 @@ moving clouds and water, so new effects in that spirit are welcome.
 ```bash
 pip install -e ".[gpu,gui]"          # gpu = cupy-cuda12x; leave it out on a machine without an NVIDIA GPU
 python -m timelapse_engine.gui        # or double-click "Timelapse Engine.bat"
-python tests/test_engine.py           # 28 tests: engine, outputs, video sizes, metadata, YUV packing, FFmpeg errors
+python tests/test_engine.py           # 29 tests: engine, GPU batches, outputs, video sizes, metadata, FFmpeg errors
 python tests/test_effects.py          # 21 tests: each new effect does what it claims
 python tests/test_sorter.py           # 22 tests: finding sequences, move/copy/undo safety, folder layout
 python tests/test_gui.py              # headless (Qt offscreen): load, preview, queue, run; Sort tab
@@ -176,6 +176,13 @@ and the engine: it splits a card dump of raws into one folder per sequence.
   `_channel_mean`.
 - **VRAM peaks:** accumulate in float64 one frame at a time, never as a float64 copy of the whole batch. That
   change took `clipped_average` from 11.9 to 7.7 GB. Prefer in-place results.
+- **Pinned buffers and async uploads:** `iter_raw` reuses three pinned host buffers, and `cp.asarray` from pinned
+  memory only *queues* the copy. A buffer must not be refilled until the GPU has copied out of it, so `iter_raw`
+  syncs the device before reusing one.
+  - Without that sync (v0.2.0 to 2026-11-14), GPU stacks over more than two batches could take frames from a
+    later batch. A 120-frame average was up to 14.5 % off.
+  - It usually missed the first job of a session, because CuPy compiling kernels slowed the CPU down.
+  - `test_gpu_batches_use_the_right_frames` guards it. Never upload from those buffers without that guarantee.
 - **Histogram entropies:** put "no change" or "neutral" values in the middle of a bin, not on a bin edge, or grey
   areas pick up false entropy.
 - **Video tests:** FFmpeg's own rgb48 to YUV path is about 0.3% off, so YUV tests check exact greys and allow a
