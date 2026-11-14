@@ -67,6 +67,18 @@ def report(progress: Optional[ProgressCallback], done: int, total: int, message:
         progress(done, total, message)
 
 
+def _can_encode(stream, text: str) -> bool:
+    """Whether ``stream`` can write ``text`` (streams without an encoding, like StringIO, take anything)."""
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return True
+    try:
+        text.encode(encoding)
+        return True
+    except (UnicodeEncodeError, LookupError):
+        return False
+
+
 class ConsoleProgress:
     """Single-line terminal progress bar with ETA.
 
@@ -80,6 +92,8 @@ class ConsoleProgress:
         self._start = time.time()
         self._message: Optional[str] = None
         self._last_done = -1
+        # Output redirected to a file or pipe on Windows uses the ANSI code page, which has no block character
+        self._fill = "█" if _can_encode(self.stream, "█") else "#"
 
     def __call__(self, done: int, total: int, message: str = "") -> None:
         if message != self._message or done < self._last_done or done == 0:
@@ -90,14 +104,18 @@ class ConsoleProgress:
         total = max(total, 1)
         fraction = min(done / total, 1.0)
         filled = int(self.bar_length * fraction)
-        bar = "█" * filled + "-" * (self.bar_length - filled)
+        bar = self._fill * filled + "-" * (self.bar_length - filled)
 
         elapsed = time.time() - self._start
         eta = (elapsed / done) * (total - done) if done else 0.0
         eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
         prefix = f"{message} " if message else ""
 
-        self.stream.write(f"\r{prefix}[{bar}] {fraction * 100:5.1f}%  ETA: {eta_str}  ({done}/{total})")
+        line = f"\r{prefix}[{bar}] {fraction * 100:5.1f}%  ETA: {eta_str}  ({done}/{total})"
+        if not _can_encode(self.stream, line):           # e.g. a file name the code page can't write
+            encoding = self.stream.encoding
+            line = line.encode(encoding, "replace").decode(encoding)
+        self.stream.write(line)
         if done >= total:
             self.stream.write("\n")
         self.stream.flush()

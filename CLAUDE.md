@@ -52,7 +52,7 @@ moving clouds and water, so new effects in that spirit are welcome.
 ```bash
 pip install -e ".[gpu,gui]"          # gpu = cupy-cuda12x; leave it out on a machine without an NVIDIA GPU
 python -m timelapse_engine.gui        # or double-click "Timelapse Engine.bat"
-python tests/test_engine.py           # 23 tests: engine, outputs, metadata, YUV packing
+python tests/test_engine.py           # 24 tests: engine, outputs, metadata, YUV packing, progress bar
 python tests/test_effects.py          # 21 tests: each new effect does what it claims
 python tests/test_sorter.py           # 22 tests: finding sequences, move/copy/undo safety, folder layout
 python tests/test_gui.py              # headless (Qt offscreen): load, preview, queue, run; Sort tab

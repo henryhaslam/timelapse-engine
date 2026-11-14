@@ -514,6 +514,21 @@ def test_render_video_and_frames():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_console_progress_on_any_encoding():
+    """Output redirected on Windows uses the ANSI code page (cp1252), which has no block character:
+    the bar falls back to '#', and characters it can't write in the message become '?'."""
+    import io
+
+    for encoding, fill, tick in (("utf-8", "█", "✓"), ("cp1252", "#", "?"), ("ascii", "#", "?")):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding=encoding)
+        bar = te.ConsoleProgress(bar_length=10, stream=stream)
+        bar(5, 10, "Reading ✓")
+        bar(10, 10, "Reading ✓")
+        text = raw.getvalue().decode(encoding)
+        assert fill * 10 in text and f"Reading {tick} [" in text and "(10/10)" in text, (encoding, text)
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
