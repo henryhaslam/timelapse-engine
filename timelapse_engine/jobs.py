@@ -96,6 +96,10 @@ _PARAM_HINTS = {
     "reverse": ("Reverse time", 0, 1, 1, "Run time the other way across the image."),
     "mirror": ("Mirror (there and back)", 0, 1, 1, "Time goes out and back, e.g. night in the middle."),
     "curve": ("Timing curve", 0.2, 5.0, 0.1, "Below 1: more of the image from late frames. Above 1: from early frames."),
+    "map_from": ("Brightness map from", 0, 0, 0,
+                 "Brightness pattern only: which image's brightness decides when each part comes from. First, "
+                 "middle or last frame, or the average of all frames (a long exposure: softer, glassier contours). "
+                 "Anything but first reads the frames twice."),
     # clean-up and trails
     "trail_length": ("Trail length (frames)", 1.0, 1000.0, 1.0, "How many frames a trail takes to fade."),
     "sigma": ("Outlier threshold (sigma)", 0.5, 5.0, 0.1, "Values further than this many std devs are ignored."),
@@ -105,6 +109,7 @@ _PARAM_CHOICES = {
     "event": ("biggest_change", "brightest", "darkest"),
     "mode": ("magnitude", "signed"),
     "pattern": ("left_to_right", "top_to_bottom", "diagonal", "radial", "circular", "brightness"),
+    "map_from": ("first", "middle", "last", "average"),
 }
 _HIDDEN_PARAMS = {"use_gpu"}
 

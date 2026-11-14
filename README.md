@@ -185,11 +185,12 @@ which reads only the frames it uses), within about 8 GB of VRAM.
 
 | Setting | |
 |---|---|
-| `pattern` | `left_to_right`, `top_to_bottom`, `diagonal` (at `angle`), `radial` (centre outwards), `circular` (clock sweep from `angle`), `brightness` (bright parts of the first frame come from late frames) |
+| `pattern` | `left_to_right`, `top_to_bottom`, `diagonal` (at `angle`), `radial` (centre outwards), `circular` (clock sweep from `angle`), `brightness` (bright parts of a reference image come from late frames: see `map_from`) |
 | `slices` | `0` = smooth: every column/ring from its own moment, blended between neighbouring frames. `N` = N bands, one frame each; only those N frames are read |
 | `feather` | 0-1: band edges blend through the frames in between |
 | `reverse`, `mirror` | run time backwards; there and back (e.g. night in the middle) |
 | `curve` | below 1 gives more of the image to the end of the sequence, above 1 to the start |
+| `map_from` | `brightness` only: whose brightness decides the timing. `first` (default), `middle` or `last` frame, or `average` of all frames. With `first` you get marbled contours in the shape of that frame's waves. `average` is a long exposure, so on a beach the slice follows the surf line: clean breaking-wave arcs. Anything but `first` reads the frames twice |
 
 ```python
 te.stack_to_file(r"E:\TL\shoot", "time_slice", r"E:\TL", pattern="radial", slices=12, feather=0.3, mirror=True)
