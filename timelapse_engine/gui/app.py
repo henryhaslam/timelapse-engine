@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 
 from PySide6.QtCore import QByteArray, QSettings, QSize, Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
                                QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
                                QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
@@ -28,8 +28,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
 from .. import __version__, backend
 from ..jobs import (KINDS, MASTERS, Job, SourceCache, default_export, is_video, load_queue, render_preview,
                     save_queue)
-from ..processors import CATEGORY_ORDER, PROCESSORS
+from ..processors import PROCESSORS
 from ..progress import CancelToken, logger
+from .effect_list import EDIT_LIST, EffectCombo, EffectListDialog, effect_categories, parse_shown
 from .sort_panel import SortPanel
 from .widgets import ImageView, ParamForm, PathPicker, Timeline
 from .worker import QtLogHandler, QueueRunner, TaskRunner
@@ -117,12 +118,17 @@ class MainWindow(QMainWindow):
         self._queue_runner: Optional[QueueRunner] = None
         self._job_started_at: Dict[int, float] = {}
         self._loading_form = False
+        # Which effects the Effect list shows: the ticked ones (None = all), unless "Show all effects" is on
+        self._effects_shown: Optional[List[str]] = parse_shown(self.settings.value("effects_shown"))
+        self._effects_show_all = self.settings.value("effects_show_all", "false") == "true"
+        self._last_process = "average"
 
         self._build_ui()
         self._connect_logging()
         self._frame_timer = QTimer(self, singleShot=True, interval=120, timeout=self._fetch_frame)
         self._preview_timer = QTimer(self, singleShot=True, interval=400, timeout=self.run_preview)
         self._restore_settings()
+        self._fill_process_combo()          # the saved list plus whatever effect the last job used
         self.statusBar().showMessage("Ready")
         self._gpu_label.setText(_gpu_status())
 
@@ -162,6 +168,16 @@ class MainWindow(QMainWindow):
                 act.setShortcut(shortcut)
             act.triggered.connect(slot)
             file_menu.addAction(act)
+        settings_menu = self.menuBar().addMenu("&Settings")
+        choose = QAction("Effects in the list…", self)
+        choose.setToolTip("Choose which effects appear in the Effect list.")
+        choose.triggered.connect(self.choose_effects)
+        settings_menu.addAction(choose)
+        self.show_all_action = QAction("Show all effects", self, checkable=True)
+        self.show_all_action.setChecked(self._effects_show_all)
+        self.show_all_action.setToolTip("List every effect, keeping your ticked list for later.")
+        self.show_all_action.toggled.connect(self._toggle_show_all)
+        settings_menu.addAction(self.show_all_action)
         help_menu = self.menuBar().addMenu("&Help")
         about = QAction("About", self)
         about.triggered.connect(lambda: QMessageBox.about(
@@ -199,20 +215,9 @@ class MainWindow(QMainWindow):
             self.kind_combo.addItem(label, key)
         self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
         fx_form.addRow("Create", self.kind_combo)
-        self.process_combo = QComboBox()
-        self.process_combo.setMaxVisibleItems(30)
-        categories = CATEGORY_ORDER + sorted({c.category for c in PROCESSORS.values()} - set(CATEGORY_ORDER))
-        for category in categories:
-            names = [n for n, c in PROCESSORS.items() if c.category == category]
-            if not names:
-                continue
-            self.process_combo.addItem(category.upper())        # group heading (not selectable)
-            heading = self.process_combo.model().item(self.process_combo.count() - 1)
-            heading.setEnabled(False)
-            heading.setSelectable(False)
-            for name in names:
-                self.process_combo.addItem("    " + DISPLAY_NAMES.get(name, name), name)
-        self.process_combo.setCurrentIndex(self.process_combo.findData("average"))
+        self.process_combo = EffectCombo()
+        self.process_combo.setMaxVisibleItems(32)
+        self._fill_process_combo("average")
         self.process_combo.currentIndexChanged.connect(self._on_process_changed)
         fx_form.addRow("Effect", self.process_combo)
         self.process_desc = QLabel()
@@ -485,6 +490,8 @@ class MainWindow(QMainWindow):
     def load_job(self, job: Job, load_source: bool = True):
         self._loading_form = True
         try:
+            if self.process_combo.findData(job.process) < 0:
+                self._fill_process_combo(job.process)       # the job's effect is hidden: list it anyway
             for combo, value in ((self.kind_combo, job.kind), (self.process_combo, job.process),
                                  (self.sort_combo, job.sort), (self.ext_combo, job.ext),
                                  (self.master_combo, job.master), (self.device_combo, job.device),
@@ -759,10 +766,95 @@ class MainWindow(QMainWindow):
             w.setVisible(kind != "video")
         self._on_settings_changed()
 
+    # ------------------------------------------------------------ effect list
+    def _visible_effects(self) -> Optional[set]:
+        """Effects the list shows, or None for all of them."""
+        if self._effects_show_all or self._effects_shown is None:
+            return None
+        return set(self._effects_shown)
+
+    def _fill_process_combo(self, keep: Optional[str] = None) -> None:
+        """(Re)build the Effect list: "Edit this list…", then the shown effects under their headings.
+        ``keep`` (default: the current effect) stays listed and selected even if it's hidden."""
+        combo = self.process_combo
+        keep = keep or self._last_process
+        visible = self._visible_effects()
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            count = "" if visible is None else f"   ({len(visible)} of {len(PROCESSORS)} effects shown)"
+            combo.addItem(f"⚙  Edit this list…{count}", EDIT_LIST)
+            edit_item = combo.model().item(0)
+            font = edit_item.font()
+            font.setItalic(True)
+            edit_item.setFont(font)
+            edit_item.setToolTip("Choose which effects appear in this list (also in the Settings menu).")
+            for category, names in effect_categories():
+                names = [n for n in names if visible is None or n in visible or n == keep]
+                if not names:
+                    continue
+                combo.addItem(category.upper())        # group heading (not selectable)
+                heading = combo.model().item(combo.count() - 1)
+                heading.setEnabled(False)
+                heading.setSelectable(False)
+                for name in names:
+                    hidden = visible is not None and name not in visible
+                    combo.addItem("    " + DISPLAY_NAMES.get(name, name) + ("   · not in your list" if hidden else ""),
+                                  name)
+            idx = combo.findData(keep)
+            if idx < 0:
+                idx = next(i for i in range(combo.count()) if combo.itemData(i) not in (None, EDIT_LIST))
+            combo.setCurrentIndex(idx)
+        finally:
+            combo.blockSignals(False)
+        if combo.currentData() != keep:
+            self._on_process_changed()
+        self._last_process = combo.currentData()
+
+    def choose_effects(self) -> None:
+        """Open the dialog to tick which effects appear in the Effect list."""
+        shown = self._effects_shown if self._effects_shown is not None else list(PROCESSORS)
+        dialog = EffectListDialog(shown, self._effects_show_all, DISPLAY_NAMES, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.set_effect_list(dialog.ticked(), dialog.show_all())
+
+    def set_effect_list(self, shown, show_all: bool = False) -> None:
+        """Save which effects the list shows (all of them = None, so new effects appear too)."""
+        shown = [n for n in shown if n in PROCESSORS] if shown is not None else None
+        self._effects_shown = shown if shown and set(shown) != set(PROCESSORS) else None
+        self._effects_show_all = bool(show_all)
+        self.settings.setValue("effects_shown", ",".join(self._effects_shown or []))
+        self.settings.setValue("effects_show_all", "true" if self._effects_show_all else "false")
+        self.show_all_action.blockSignals(True)
+        self.show_all_action.setChecked(self._effects_show_all)
+        self.show_all_action.blockSignals(False)
+        self._fill_process_combo(self._last_process)
+
+    def _toggle_show_all(self, checked: bool) -> None:
+        self.set_effect_list(self._effects_shown, checked)
+
+    def _after_edit_item(self, open_dialog: bool) -> None:
+        """'Edit this list…' was picked: go back to the effect that was selected, then open the dialog
+        (only when it was picked from the open list, not scrolled onto with the mouse wheel)."""
+        idx = self.process_combo.findData(self._last_process)
+        if idx >= 0:
+            self.process_combo.blockSignals(True)
+            self.process_combo.setCurrentIndex(idx)
+            self.process_combo.blockSignals(False)
+        else:
+            self._fill_process_combo(self._last_process)
+        if open_dialog:
+            self.choose_effects()
+
     def _on_process_changed(self, *_):
         name = self.process_combo.currentData()
+        if name == EDIT_LIST:
+            from_popup = self.process_combo.picked_from_popup
+            QTimer.singleShot(0, lambda: self._after_edit_item(from_popup))
+            return
         if name is None:  # a group heading
             return
+        self._last_process = name
         self.process_desc.setText(PROCESSORS[name].description)
         if not self._loading_form:
             self.param_form.set_processor(name)

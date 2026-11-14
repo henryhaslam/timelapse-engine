@@ -26,6 +26,10 @@ The app has two tabs: **Sort raw files** (below) and **Stack and render**.
   limit the job to a frame range. The scrubber steps through frames, showing each file name and capture time.
 - **Effect:** choose what to create (single image, video or image sequence), the effect and its settings. The
   settings form is built from each effect's parameters, with tooltips.
+- **Shorter effect list:** *⚙ Edit this list…* at the top of the Effect list (or **Settings → Effects in the
+  list…**) lets you tick the effects you use; the rest are hidden. **Settings → Show all effects** brings every
+  effect back and keeps your ticks for later. A saved job whose effect is hidden still loads, and the effect
+  appears in the list marked *not in your list*.
 - **Preview** (Ctrl+P) renders the current settings in about a second at reduced resolution, using frames spread
   across the sequence for a still, or the rolling window at the scrubber for video. With *Update automatically*
   on, it re-renders as you change settings or scrub. Wheel to zoom, drag to pan, double-click to fit.

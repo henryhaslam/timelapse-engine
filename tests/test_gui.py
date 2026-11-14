@@ -257,6 +257,96 @@ def test_sort_tab():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_effect_list():
+    """Settings > Effects in the list: only ticked effects are listed, a hidden job effect still loads,
+    Show all brings everything back without losing the ticks, and it's remembered."""
+    if QApplication is None:
+        print("  (PySide6 not installed, skipping)")
+        return
+    from timelapse_engine.gui.app import MainWindow
+    from timelapse_engine.gui.effect_list import EDIT_LIST, EffectListDialog
+    from timelapse_engine.processors import PROCESSORS
+
+    def effects(combo):
+        return [combo.itemData(i) for i in range(combo.count()) if combo.itemData(i) not in (None, EDIT_LIST)]
+
+    def headings(combo):
+        return [combo.itemText(i) for i in range(combo.count()) if combo.itemData(i) is None]
+
+    tmp = Path(tempfile.mkdtemp())
+    QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp / "settings"))
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    win.show()
+    try:
+        combo = win.process_combo
+        assert combo.itemData(0) == EDIT_LIST and "Edit this list" in combo.itemText(0)
+        assert sorted(effects(combo)) == sorted(PROCESSORS)          # everything by default
+
+        favourites = ["average", "maximum", "temporal_entropy", "time_of_peak"]
+        win.set_effect_list(favourites)
+        assert effects(combo) == favourites
+        assert headings(combo) == ["STACKS", "TEMPORAL COLOUR", "MOTION AND TIME"]
+        assert "4 of" in combo.itemText(0)
+
+        # The selected effect stays listed (marked) when it's hidden, until something else is picked
+        combo.setCurrentIndex(combo.findData("maximum"))
+        win.set_effect_list(["average", "temporal_entropy"])
+        assert combo.currentData() == "maximum" and "not in your list" in combo.itemText(combo.currentIndex())
+        win.set_effect_list(favourites)
+
+        # A job using a hidden effect still loads, with its settings
+        win.load_job(Job(process="time_slice", params={"pattern": "radial"}), load_source=False)
+        assert combo.currentData() == "time_slice" and win.current_job().params.get("pattern") == "radial"
+        combo.setCurrentIndex(combo.findData("average"))
+
+        # Scrolling onto "Edit this list…" just goes back to the effect; picking it from the list opens the dialog
+        opened = []
+        win.choose_effects = lambda: opened.append(True)
+        combo.setCurrentIndex(0)
+        wait_until(app, lambda: combo.currentData() == "average", what="revert from Edit this list")
+        assert not opened
+        combo.showPopup()
+        view = combo.view()
+        QTest.mouseClick(view.viewport(), Qt.LeftButton, Qt.NoModifier,
+                         view.visualRect(combo.model().index(0, 0)).center())
+        wait_until(app, lambda: opened, what="dialog from the pop-up")
+        assert combo.currentData() == "average"
+        del win.choose_effects
+
+        # Show all effects: everything back, ticks kept for later
+        win.show_all_action.setChecked(True)
+        assert sorted(effects(combo)) == sorted(PROCESSORS) and "of" not in combo.itemText(0)
+        win.show_all_action.setChecked(False)
+        assert effects(combo) == favourites
+
+        # The dialog: tick all / untick all, OK needs at least one tick unless Show all is on
+        from PySide6.QtWidgets import QDialogButtonBox
+
+        dialog = EffectListDialog(favourites, False, {}, win)
+        ok = dialog.buttons.button(QDialogButtonBox.Ok)
+        assert dialog.ticked() == favourites
+        dialog.set_ticked([])
+        assert not ok.isEnabled()
+        dialog.show_all_check.setChecked(True)
+        assert ok.isEnabled()
+        dialog.set_ticked(PROCESSORS)
+        assert sorted(dialog.ticked()) == sorted(PROCESSORS)
+        dialog.deleteLater()
+
+        # Remembered next time
+        win.close()
+        app.processEvents()
+        win = MainWindow()
+        assert effects(win.process_combo) == favourites and not win.show_all_action.isChecked()
+        win.set_effect_list(list(PROCESSORS))                         # ticking everything = all, new effects too
+        assert win._effects_shown is None and sorted(effects(win.process_combo)) == sorted(PROCESSORS)
+    finally:
+        win.close()
+        app.processEvents()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_job_validation():
     errors = Job().validate()
     assert any("image folder or video" in e for e in errors) and any("output folder" in e for e in errors)

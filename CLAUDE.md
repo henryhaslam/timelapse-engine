@@ -42,6 +42,8 @@ moving clouds and water, so new effects in that spirit are welcome.
   refused the DNG ("does not contain a supported format"). The owner dropped the idea because the entropy
   effects can't use raw mosaics. Leave it as is unless asked.
 - `feature/effects`, `feature/raw-sorter` and `feature/gui` are merged; new work branches from `main`.
+- `feature/effect-list`: the Settings menu and "Edit this list…" for choosing which effects the Effect list
+  shows.
 
 ## Setup, run, test
 
@@ -102,6 +104,14 @@ Interpolation writes the in-between frames to the sinks.
 - The GUI (`gui/app.py`) builds each effect's settings form from its constructor signature through
   `jobs.processor_params`.
 - Long work runs on QThreads (`gui/worker.py`). Settings are saved in `%APPDATA%\timelapse-engine\gui.ini`.
+- **Effect list** (`gui/effect_list.py`):
+  - `_fill_process_combo` rebuilds the Effect list from the ticked effects (`effects_shown` in gui.ini; empty
+    means all, so new effects appear) unless `effects_show_all` is on. The current or loaded effect is always
+    listed, marked "not in your list" if it's hidden.
+  - The first item, `EDIT_LIST`, opens `EffectListDialog`. When it's picked, the combo goes back to the
+    previous effect.
+  - **Trap:** Qt 6 closes a combo's pop-up *before* it changes the current item. `EffectCombo.picked_from_popup`
+    counts "just closed" so that picking from the pop-up opens the dialog but the mouse wheel doesn't.
 
 **Raw sorter** (`sorter.py`, GUI `gui/sort_panel.py`, CLI `timelapse-sort`). This is the step before Lightroom
 and the engine: it splits a card dump of raws into one folder per sequence.
