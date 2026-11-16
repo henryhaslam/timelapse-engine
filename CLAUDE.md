@@ -9,7 +9,7 @@ A GPU-accelerated engine (CuPy, with a NumPy fallback) for stacking and blending
 PySide6 desktop app. Sequences are thousands of Lightroom-exported JPEGs or 16-bit TIFFs, often ProPhoto RGB and
 hundreds of GB in total. It is a rewrite of `legacy/image_functions_2.py`, which is kept for reference only:
 never edit it. The originals outside the repo (`image_functions_2.py`, `image_tests.ipynb`, `slice_functions.py`
-in the parent `OneDrive\Python` folder) also stay untouched.
+in `C:\Users\Henry\OneDrive\Python` on the desktop) also stay untouched.
 
 The owner mostly uses the desktop app. Temporal entropy is their favourite effect: they want vivid colours from
 moving clouds and water, so new effects in that spirit are welcome.
@@ -19,7 +19,7 @@ moving clouds and water, so new effects in that spirit are welcome.
 | | Desktop | Laptop |
 |---|---|---|
 | Hardware | Ryzen 7 7700X, RTX 3080 Ti 12 GB, 64 GB RAM | Ryzen AI 9 HX 370, RTX 4070 laptop GPU (8 GB), 32 GB RAM |
-| Repo | `C:\Users\Henry\OneDrive\Python\timelapse-engine` (to move to `C:\dev` too) | `C:\dev\timelapse-engine`, with exiftool in `C:\dev\exiftool-13.59_32` |
+| Repo | `C:\dev\timelapse-engine`, with exiftool in `C:\dev\exiftool-13.59_32` (moved out of OneDrive on 2026-11-16) | `C:\dev\timelapse-engine`, with exiftool in `C:\dev\exiftool-13.59_32` |
 | Real footage | `C:\Users\Henry\Videos\TL_temp\...`, e.g. `copenhagen\2026.06.07_copenhill\export_tiff` (16-bit ProPhoto TIFF, 312 frames) | `C:\Users\henry\Videos\tl_temp\terifa\raw`: 638 G9 II RW2 raws, 6 sequences (sorter test card) |
 
 - Code moves between machines through GitHub (`henryhaslam/timelapse-engine`), never through OneDrive. Two
